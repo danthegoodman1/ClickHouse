@@ -73,6 +73,7 @@ public:
     explicit Client(ClientSettings settings_);
 
     const std::string & endpoint() const { return settings.endpoint; }
+    std::chrono::milliseconds attemptTimeout() const { return settings.attempt_timeout; }
 
     /// Fills in the request id.
     pb::CommitResponse commit(pb::CommitRequest request) const;

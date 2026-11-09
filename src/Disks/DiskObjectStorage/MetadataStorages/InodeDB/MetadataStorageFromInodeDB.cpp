@@ -16,6 +16,7 @@
 #include <magic_enum.hpp>
 
 #include <base/defines.h>
+#include <base/scope_guard.h>
 
 #include <condition_variable>
 #include <deque>
@@ -783,7 +784,8 @@ pb::CommitRequest InodeDBBatchBuilder::finish()
 }
 
 
-/// Holds a replica's InodeDB lease from a thread of its own, renewing it every 10 seconds.
+/// Holds a replica's InodeDB lease from a thread of its own, renewing it every 10 seconds, and releases it on
+/// destruction, so the writer can delete what it held right away.
 ///
 /// The lease opens at the newest version. Its oldest version moves to a version the replica observed only once
 /// `lag` has passed since, so the blobs of every part a query started with outlive the query, as long as it
@@ -799,13 +801,14 @@ public:
 
     ~InodeDBReaderLease()
     {
-        {
-            std::lock_guard lock(mutex);
-            stopped = true;
-            if (stream)
-                stream->cancel();
-        }
+        std::unique_lock lock(mutex);
+        stopped = true;
         stopped_cv.notify_all();
+        /// The thread releases the lease on its way out, in one round trip. A beat or release still waiting after
+        /// an attempt's deadline is cancelled, and InodeDB lets the lease run out its TTL.
+        if (!stopped_cv.wait_for(lock, client->attemptTimeout(), [this] { return finished; }) && stream)
+            stream->cancel();
+        lock.unlock();
         thread.join();
     }
 
@@ -827,6 +830,13 @@ private:
 
     void run()
     {
+        SCOPE_EXIT({
+            std::lock_guard lock(mutex);
+            stream.reset();
+            finished = true;
+            stopped_cv.notify_all();
+        });
+
         while (true)
         {
             try
@@ -869,14 +879,19 @@ private:
                     }
                 }
 
-                std::lock_guard lock(mutex);
-                if (stopped)
+                bool stop = false;
+                {
+                    std::lock_guard lock(mutex);
+                    stop = stopped;
+                    if (!stop)
+                        stream.reset();
+                }
+                /// Outside the lock, so the destructor can cancel a release that hangs.
+                if (stop)
                 {
                     stream->release(lease);
-                    stream.reset();
                     return;
                 }
-                stream.reset();
             }
             catch (...)
             {
@@ -898,8 +913,10 @@ private:
     const LoggerPtr log;
 
     std::mutex mutex;
+    /// Signals both `stopped` and `finished`.
     std::condition_variable stopped_cv;
     bool stopped = false;
+    bool finished = false;
     std::unique_ptr<InodeDB::LeaseStream> stream;
     std::deque<std::pair<std::chrono::steady_clock::time_point, UInt64>> observed;
     ThreadFromGlobalPool thread;
