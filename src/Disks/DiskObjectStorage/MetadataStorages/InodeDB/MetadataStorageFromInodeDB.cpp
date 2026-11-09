@@ -243,7 +243,7 @@ public:
     std::optional<size_t> intentOfOp(size_t op_index) const { return op_intents.at(op_index); }
     bool isBlindCreate(size_t op_index) const { return blind_creates.at(op_index); }
     bool freesAnything() const { return frees; }
-    const std::vector<std::string> & spillsWritten() const { return spills; }
+    const std::vector<std::string> & blobsWritten() const { return written_blobs; }
 
 private:
     struct FileNode
@@ -301,7 +301,8 @@ private:
     std::vector<std::optional<size_t>> op_intents;
     std::vector<bool> blind_creates;
     StoredObjects dropped;
-    std::vector<std::string> spills;
+    /// Blobs this batch wrote: spilled records and inline bytes moved out by an append.
+    std::vector<std::string> written_blobs;
     bool frees = false;
 };
 
@@ -374,8 +375,8 @@ void InodeDBBatchBuilder::putValue(const std::string & path, FileNodePtr node, V
     value.ctime = ctime;
     if (value.kind == ValueKind::Record && value.body.size() > storage.settings.spill_threshold)
     {
-        std::string key = storage.writeSpilled(value.body);
-        spills.push_back(key);
+        std::string key = storage.writeBlob(value.body);
+        written_blobs.push_back(key);
         value.kind = ValueKind::Spilled;
         value.body = std::move(key);
     }
@@ -631,12 +632,15 @@ void InodeDBBatchBuilder::apply(const Intent & intent, size_t intent_index)
             break;
         }
         case IntentKind::CreateMetadataFile:
+        case IntentKind::WriteInline:
         {
+            /// Both rewrite the file: blobs, or inline bytes, as `MetadataStorageFromMemory` writes them.
             auto node = lookup(path);
             auto old_value = base(node);
             DiskObjectStorageMetadata record(storage.compatible_key_prefix, path);
             record.read_only = baseRecord(old_value, path).read_only;
             record.objects = intent.objects;
+            record.inline_data = intent.data;
             dropReplaced(old_value, record.objects, path);
             frees |= old_value.has_value();
             putValue(path, node, recordValue(record), intent_index);
@@ -654,21 +658,19 @@ void InodeDBBatchBuilder::apply(const Intent & intent, size_t intent_index)
             putValue(path, node, std::move(value), intent_index);
             break;
         }
-        case IntentKind::WriteInline:
-        {
-            auto node = lookup(path);
-            auto old_value = base(node);
-            auto record = baseRecord(old_value, path);
-            record.inline_data = intent.data;
-            dropReplaced(old_value, record.objects, path);
-            putValue(path, node, recordValue(record), intent_index);
-            break;
-        }
         case IntentKind::AddBlob:
         {
             auto node = lookup(path);
             auto old_value = base(node);
             auto record = baseRecord(old_value, path);
+            /// Inline bytes and blobs never share a record, so an append moves inline bytes to a blob first.
+            if (!record.inline_data.empty())
+            {
+                std::string key = storage.writeBlob(record.inline_data);
+                written_blobs.push_back(key);
+                record.objects.emplace_back(key, path, record.inline_data.size());
+                record.inline_data.clear();
+            }
             record.objects.push_back(intent.objects.at(0));
             dropReplaced(old_value, record.objects, path);
             putValue(path, node, recordValue(record), intent_index);
@@ -685,11 +687,21 @@ void InodeDBBatchBuilder::apply(const Intent & intent, size_t intent_index)
                 break;
             }
             auto record = baseRecord(old_value, path);
-            size_t size = getTotalSize(record.objects);
-            while (size > intent.number)
+            size_t size;
+            if (!record.inline_data.empty())
             {
-                size -= record.objects.back().bytes_size;
-                record.objects.pop_back();
+                record.inline_data.resize(std::min<size_t>(record.inline_data.size(), intent.number));
+                size = record.inline_data.size();
+            }
+            else
+            {
+                /// Blobs go whole, so the size must fall on a blob boundary.
+                size = getTotalSize(record.objects);
+                while (size > intent.number)
+                {
+                    size -= record.objects.back().bytes_size;
+                    record.objects.pop_back();
+                }
             }
             if (size != intent.number)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "File `{}` can't be truncated to size {}", intent.path, intent.number);
@@ -1110,16 +1122,16 @@ std::string MetadataStorageFromInodeDB::readSpilled(const std::string & key) con
     return text;
 }
 
-std::string MetadataStorageFromInodeDB::writeSpilled(const std::string & record_text) const
+std::string MetadataStorageFromInodeDB::writeBlob(const std::string & bytes) const
 {
     std::string key = key_generator->generate().serialize();
     auto buf = object_storage->writeObject(StoredObject(key), WriteMode::Rewrite);
-    writeString(record_text, *buf);
+    writeString(bytes, *buf);
     buf->finalize();
     return key;
 }
 
-void MetadataStorageFromInodeDB::removeSpilled(const std::vector<std::string> & keys) const noexcept
+void MetadataStorageFromInodeDB::removeUnappliedBlobs(const std::vector<std::string> & keys) const noexcept
 {
     if (keys.empty())
         return;
@@ -1132,7 +1144,7 @@ void MetadataStorageFromInodeDB::removeSpilled(const std::vector<std::string> & 
     }
     catch (...)
     {
-        tryLogCurrentException(log, "Removing spilled records of a batch that did not apply");
+        tryLogCurrentException(log, "Removing the blobs of a batch that did not apply");
     }
 }
 
@@ -1551,7 +1563,6 @@ bool MetadataStorageFromInodeDBTransaction::Intent::readsState() const
     {
         case IntentKind::AddBlob:
         case IntentKind::TruncateFile:
-        case IntentKind::WriteInline:
         case IntentKind::SetReadOnly:
             return true;
         case IntentKind::UnlinkFile:
@@ -1594,11 +1605,11 @@ MetadataStorageFromInodeDBTransaction::AttemptResult MetadataStorageFromInodeDBT
     }
     catch (...)
     {
-        storage.removeSpilled(builder.spillsWritten());
+        storage.removeUnappliedBlobs(builder.blobsWritten());
         throw;
     }
 
-    /// If the call itself fails, the batch may have applied, so its spilled records stay, and nothing cached
+    /// If the call itself fails, the batch may have applied, so the blobs it wrote stay, and nothing cached
     /// can be trusted.
     pb::CommitResponse response;
     try
@@ -1620,7 +1631,7 @@ MetadataStorageFromInodeDBTransaction::AttemptResult MetadataStorageFromInodeDBT
             continue;
 
         /// The batch is all-or-nothing, so nothing applied.
-        storage.removeSpilled(builder.spillsWritten());
+        storage.removeUnappliedBlobs(builder.blobsWritten());
 
         const auto & skipped = outcome.skipped();
         if (skipped.reason_case() == pb::Skipped::kWhen)

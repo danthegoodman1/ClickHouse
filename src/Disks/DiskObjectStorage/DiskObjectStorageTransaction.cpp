@@ -403,8 +403,10 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
     };
 
     /// Defer the inline-vs-blob decision until the size is known (see `WriteBufferInlineOrBlob`).
-    const size_t max_inline_bytes
-        = (mode == WriteMode::Rewrite && metadata_storage->supportsInlineData()) ? settings.inline_file_max_bytes : 0;
+    /// BigHouse: the metadata storage can raise the threshold.
+    const size_t max_inline_bytes = (mode == WriteMode::Rewrite && metadata_storage->supportsInlineData())
+        ? std::max(settings.inline_file_max_bytes, metadata_storage->getInlineFileMaxBytes())
+        : 0;
     return std::make_unique<WriteBufferInlineOrBlob>(
         path, max_inline_bytes, create_blob_if_empty, std::move(create_blob_buffer), std::move(create_metadata_callback), buf_size);
 }

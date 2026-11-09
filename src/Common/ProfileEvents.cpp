@@ -1888,6 +1888,16 @@ The server successfully detected this situation and will download merged part fr
     M(StatelessWorkerDiscoveryWorkersHeartbeatExpired, "Number of stateless workers reclaimed by the stateless worker discovery service because they stopped sending heartbeats.", ValueType::Number) \
     M(StatelessWorkerDiscoveryHeartbeatsRejected, "Number of heartbeats the stateless worker discovery service rejected because the worker had already been evicted.", ValueType::Number) \
     M(StatelessWorkerDiscoveryKeeperTransactionRetries, "Number of write transactions the stateless worker discovery service retried because its coordination store (Keeper) state was modified concurrently.", ValueType::Number) \
+    /* BigHouse: calls of the `inodedb` metadata type to InodeDB. */ \
+    M(InodeDBCommit, "Number of InodeDB `Commit` calls: one per metadata transaction of an `inodedb` disk, more when a transaction retries in read mode.", ValueType::Number) \
+    M(InodeDBStat, "Number of InodeDB `Stat` calls of `inodedb` disks.", ValueType::Number) \
+    M(InodeDBRead, "Number of InodeDB `Read` calls of `inodedb` disks.", ValueType::Number) \
+    M(InodeDBList, "Number of InodeDB `List` calls of `inodedb` disks.", ValueType::Number) \
+    M(InodeDBClaimFreed, "Number of InodeDB `ClaimFreed` calls of `inodedb` disks.", ValueType::Number) \
+    M(InodeDBAckFreed, "Number of InodeDB `AckFreed` calls of `inodedb` disks.", ValueType::Number) \
+    M(InodeDBMintKey, "Number of InodeDB `MintKey` calls.", ValueType::Number) \
+    M(InodeDBRetries, "Number of InodeDB call attempts retried after the server was unavailable or slow to answer.", ValueType::Number) \
+    M(InodeDBMicroseconds, "Total time spent in InodeDB calls, retries included.", ValueType::Microseconds) \
     \
 
 #ifdef APPLY_FOR_EXTERNAL_EVENTS

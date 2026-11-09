@@ -27,6 +27,8 @@ public:
 
     bool supportsEmptyFilesWithoutBlobs() const override;
     bool supportsInlineData() const override;
+    /// BigHouse: delegates like `supportsInlineData`.
+    size_t getInlineFileMaxBytes() const override;
     bool appliesOperationsEagerly() const override;
     bool areBlobPathsRandom() const override;
     ObjectStorageKeyGeneratorPtr getKeyGenerator() const override;

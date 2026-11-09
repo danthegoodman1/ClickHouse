@@ -30,6 +30,9 @@ struct InodeDBMetadataSettings
     bool read_only = false;
     /// A record whose text passes this many bytes moves to a blob, since an InodeDB value holds 64 KiB.
     size_t spill_threshold = 32 * 1024;
+    /// Files up to this size keep their bytes in their record instead of a blob, so writing them costs no
+    /// object-storage request and a directory listing reads them. Smaller than `spill_threshold`.
+    size_t inline_file_max_bytes = 16 * 1024;
     /// Freed files claimed from InodeDB at a time.
     UInt32 claim_batch = 1000;
     /// A replica's lease holds what InodeDB froze at the versions it read until this long after it read
@@ -72,6 +75,8 @@ public:
     MetadataStorageType getType() const override { return MetadataStorageType::InodeDB; }
 
     bool supportsEmptyFilesWithoutBlobs() const override { return true; }
+    bool supportsInlineData() const override { return true; }
+    size_t getInlineFileMaxBytes() const override { return settings.inline_file_max_bytes; }
     bool areBlobPathsRandom() const override { return true; }
     bool supportWritingWithAppend() const override { return true; }
     ObjectStorageKeyGeneratorPtr getKeyGenerator() const override { return key_generator; }
@@ -148,9 +153,11 @@ private:
     StoredObjects blobsOwnedBy(const InodeDB::Value & value, const std::string & path) const;
 
     std::string readSpilled(const std::string & key) const;
-    /// Writes record text to a new blob and returns its key.
-    std::string writeSpilled(const std::string & record_text) const;
-    void removeSpilled(const std::vector<std::string> & keys) const noexcept;
+    /// Writes bytes to a new blob and returns its key: a spilled record, or the bytes of an inline file that
+    /// an append moves out of its record.
+    std::string writeBlob(const std::string & bytes) const;
+    /// Deletes the blobs a batch wrote, once the batch is known to have applied nothing.
+    void removeUnappliedBlobs(const std::vector<std::string> & keys) const noexcept;
 
     void assertWritable() const;
 

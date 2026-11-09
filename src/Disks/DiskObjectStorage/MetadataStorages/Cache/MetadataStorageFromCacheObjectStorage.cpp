@@ -49,6 +49,12 @@ bool MetadataStorageFromCacheObjectStorage::supportsInlineData() const
     return underlying->supportsInlineData();
 }
 
+/// BigHouse: delegates like `supportsInlineData`.
+size_t MetadataStorageFromCacheObjectStorage::getInlineFileMaxBytes() const
+{
+    return underlying->getInlineFileMaxBytes();
+}
+
 bool MetadataStorageFromCacheObjectStorage::appliesOperationsEagerly() const
 {
     return underlying->appliesOperationsEagerly();

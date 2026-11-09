@@ -51,6 +51,12 @@ public:
         return active_metadatas[path];
     }
 
+    DB::ObjectStoragePtr getObjectStorage(const std::string & path)
+    {
+        std::unique_lock<std::mutex> lock(active_metadatas_mutex);
+        return object_storages.at(path);
+    }
+
     std::shared_ptr<DB::IDisk> getMetadataDisk(const std::string & path)
     {
         std::unique_lock<std::mutex> lock(active_metadatas_mutex);
@@ -97,6 +103,7 @@ private:
             fs::create_directories(object_storage_dir);
             object_storage_dirs.push_back(object_storage_dir);
             auto object_storage = std::make_shared<DB::LocalObjectStorage>(DB::LocalObjectStorageSettings("test", object_storage_dir, /*read_only_=*/ false));
+            object_storages[path] = object_storage;
 
             auto metadata = std::make_shared<DB::MetadataStorageFromInodeDB>(
                 std::make_shared<DB::InodeDB::Client>(DB::InodeDB::ClientSettings{.endpoint = endpoint, .key = key}),
@@ -119,6 +126,7 @@ private:
     std::unordered_map<std::string, std::shared_ptr<DB::IMetadataStorage>> active_metadatas;
     std::unordered_map<std::string, std::shared_ptr<DB::IDisk>> active_disks;
     std::vector<std::string> object_storage_dirs;
+    std::unordered_map<std::string, DB::ObjectStoragePtr> object_storages;
 };
 
 INSTANTIATE_TEST_SUITE_P(Metadata, MetadataDiskTest, testing::Values("local", "inodedb"), [](const testing::TestParamInfo<std::string> & param_info) { return param_info.param; });
@@ -1516,4 +1524,137 @@ TEST_P(MetadataDiskTest, TestNonExistingObjectsInTransaction)
                 transaction->commit(DB::NoCommitOptions{});
             });
     }
+}
+
+/// BigHouse: the blobs a metadata storage queued for removal, recorded as removed.
+static std::set<std::string> drainBlobsToRemove(const DB::MetadataStoragePtr & metadata)
+{
+    std::unordered_map<DB::Location, DB::LocationInfo> cluster_registry = {{"main", {true, true, ""}}};
+    auto cluster = std::make_shared<DB::ClusterConfiguration>("disk", std::move(cluster_registry));
+    std::set<std::string> keys;
+    DB::StoredObjects objects;
+    for (const auto & [object, _] : metadata->getBlobsToRemove(cluster, 10000))
+    {
+        keys.insert(object.remote_path);
+        objects.push_back(object);
+    }
+    metadata->recordAsRemoved(objects);
+    return keys;
+}
+
+/// BigHouse: `inodedb` writes inline files as rewrites, as `MetadataStorageFromMemory` does. It also supports
+/// appends, so an append moves inline bytes to a blob of their own, and a truncation cuts inline bytes.
+TEST_P(MetadataDiskTest, TestInlineRewriteAppendTruncate)
+{
+    if (GetParam() != "inodedb")
+        GTEST_SKIP() << "`local` metadata writes no inline files";
+
+    auto metadata = getMetadataStorage("/TestInlineRewriteAppendTruncate");
+    auto blob = [](const std::string & key, size_t size)
+    {
+        return DB::StoredObject(DB::ObjectStorageKey::createAsAbsolute(key).serialize(), "f.txt", size);
+    };
+
+    {
+        auto transaction = metadata->createTransaction();
+        transaction->createMetadataFile("f.txt", {blob("old", 10)});
+        transaction->commit(DB::NoCommitOptions{});
+    }
+    {
+        auto transaction = metadata->createTransaction();
+        transaction->writeInlineDataToFile("f.txt", "hello");
+        transaction->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_EQ(metadata->readInlineDataToString("f.txt"), "hello");
+    EXPECT_TRUE(metadata->getStorageObjects("f.txt").empty());
+    EXPECT_EQ(metadata->getFileSize("f.txt"), 5);
+    EXPECT_EQ(drainBlobsToRemove(metadata), std::set<std::string>{"old"});
+
+    {
+        auto transaction = metadata->createTransaction();
+        transaction->addBlobToMetadata("f.txt", blob("tail", 3));
+        transaction->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_EQ(metadata->readInlineDataToString("f.txt"), "");
+    EXPECT_EQ(metadata->getFileSize("f.txt"), 8);
+    auto objects = metadata->getStorageObjects("f.txt");
+    ASSERT_EQ(objects.size(), 2);
+    EXPECT_EQ(objects[0].bytes_size, 5);
+    EXPECT_EQ(objects[1].remote_path, "tail");
+    {
+        auto buf = getObjectStorage("/TestInlineRewriteAppendTruncate")->readObject(objects[0], DB::ReadSettings{});
+        std::string bytes;
+        DB::readStringUntilEOF(bytes, *buf);
+        EXPECT_EQ(bytes, "hello");
+    }
+    EXPECT_TRUE(drainBlobsToRemove(metadata).empty());
+
+    {
+        auto transaction = metadata->createTransaction();
+        transaction->writeInlineDataToFile("g.txt", "abcdef");
+        transaction->truncateFile("g.txt", 2);
+        transaction->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_EQ(metadata->readInlineDataToString("g.txt"), "ab");
+    EXPECT_EQ(metadata->getFileSize("g.txt"), 2);
+
+    {
+        auto transaction = metadata->createTransaction();
+        transaction->unlinkFile("f.txt", /*if_exists=*/ false, /*should_remove_objects=*/ true);
+        transaction->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_EQ(drainBlobsToRemove(metadata), (std::set<std::string>{objects[0].remote_path, "tail"}));
+}
+
+/// BigHouse: a record past `inodedb_spill_threshold` lives in a blob of its own. Rewriting the record frees the
+/// previous one, and removing the file deletes the spill blob after the blobs it names.
+TEST_P(MetadataDiskTest, TestSpilledRecord)
+{
+    if (GetParam() != "inodedb")
+        GTEST_SKIP() << "`local` metadata keeps records in local files";
+
+    auto metadata = getMetadataStorage("/TestSpilledRecord");
+    auto key = [](size_t i) { return fmt::format("{:0>200}", i); };
+    for (size_t i = 0; i < 200; ++i)
+    {
+        auto transaction = metadata->createTransaction();
+        transaction->addBlobToMetadata("big.bin", DB::StoredObject(DB::ObjectStorageKey::createAsAbsolute(key(i)).serialize(), "big.bin", 1));
+        transaction->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_EQ(metadata->getStorageObjects("big.bin").size(), 200);
+    EXPECT_EQ(metadata->getFileSize("big.bin"), 200);
+
+    /// 190 entries of 200 characters still pass the threshold.
+    {
+        auto transaction = metadata->createTransaction();
+        transaction->truncateFile("big.bin", 190);
+        transaction->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_EQ(metadata->getStorageObjects("big.bin").size(), 190);
+    EXPECT_GT(metadata->readFileToString("big.bin").size(), DB::InodeDBMetadataSettings{}.spill_threshold);
+
+    /// The truncated blobs go, and so does every spill blob a rewrite replaced.
+    auto removed = drainBlobsToRemove(metadata);
+    size_t replaced_spills = 0;
+    for (size_t i = 0; i < 200; ++i)
+        EXPECT_EQ(removed.contains(key(i)), i >= 190) << i;
+    for (const auto & path : removed)
+        replaced_spills += path.size() != 200;
+    EXPECT_GT(replaced_spills, 0);
+    EXPECT_EQ(removed.size(), 10 + replaced_spills);
+
+    {
+        auto transaction = metadata->createTransaction();
+        transaction->unlinkFile("big.bin", /*if_exists=*/ false, /*should_remove_objects=*/ true);
+        transaction->commit(DB::NoCommitOptions{});
+    }
+    removed = drainBlobsToRemove(metadata);
+    EXPECT_EQ(removed.size(), 190);
+    for (size_t i = 0; i < 190; ++i)
+        EXPECT_TRUE(removed.contains(key(i))) << i;
+
+    /// The spill blob goes in a second phase, once the blobs it names are gone.
+    auto second_phase = drainBlobsToRemove(metadata);
+    ASSERT_EQ(second_phase.size(), 1);
+    EXPECT_TRUE(getObjectStorage("/TestSpilledRecord")->exists(DB::StoredObject(*second_phase.begin())));
 }

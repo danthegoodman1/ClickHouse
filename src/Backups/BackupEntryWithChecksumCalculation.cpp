@@ -124,7 +124,10 @@ bool BackupEntryWithChecksumCalculation::hasPrecalculatedChecksum() const
 
 bool BackupEntryWithChecksumCalculation::canCalculateChecksumFromRemotePath() const
 {
-    return isChecksumFromRemotePathAllowed() && !getFilePath().empty() && getDisk() && getDisk()->areBlobPathsRandom();
+    if (!isChecksumFromRemotePathAllowed() || getFilePath().empty() || !getDisk() || !getDisk()->areBlobPathsRandom())
+        return false;
+    /// BigHouse: a non-empty file without blobs keeps its content inline in its metadata, so only its bytes identify it.
+    return getSize() == 0 || !getDisk()->getStorageObjects(getFilePath()).empty();
 }
 
 

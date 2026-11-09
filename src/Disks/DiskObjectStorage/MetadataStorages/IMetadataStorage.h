@@ -195,6 +195,9 @@ public:
     /// (see `WriteSettings::inline_file_max_bytes`).
     virtual bool supportsInlineData() const { return false; }
 
+    /// BigHouse: the largest file that `DiskObjectStorage` writes inline when the write settings ask for less.
+    virtual size_t getInlineFileMaxBytes() const { return 0; }
+
     /// Returns true if underlying blob ids generator uses random.
     virtual bool areBlobPathsRandom() const = 0;
 

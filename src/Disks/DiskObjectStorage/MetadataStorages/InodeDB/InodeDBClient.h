@@ -5,6 +5,7 @@
 #if USE_GRPC
 
 #include <base/types.h>
+#include <Common/ProfileEvents.h>
 
 #include <inodedb.grpc.pb.h>
 
@@ -96,10 +97,10 @@ private:
     static ChannelPtr connect(const std::string & target);
     ChannelPtr currentChannel() const;
 
-    /// Runs `attempt` until it succeeds, fails for good, or `retry_timeout` passes.
+    /// Runs `attempt` until it succeeds, fails for good, or `retry_timeout` passes, and counts the call in `event`.
     /// `attempt` takes the stub and a prepared context and returns the call's status.
     template <typename Attempt>
-    void invoke(std::string_view method, Attempt && attempt) const;
+    void invoke(std::string_view method, ProfileEvents::Event event, Attempt && attempt) const;
 
     ClientSettings settings;
     std::string authorization;

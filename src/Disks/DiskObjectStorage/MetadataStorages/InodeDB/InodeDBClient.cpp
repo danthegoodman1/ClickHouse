@@ -3,7 +3,10 @@
 #if USE_GRPC
 
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
+#include <Common/Stopwatch.h>
 #include <Common/thread_local_rng.h>
+#include <base/scope_guard.h>
 #include <base/sleep.h>
 
 #include <cstring>
@@ -11,6 +14,19 @@
 #include <grpcpp/create_channel.h>
 #include <grpcpp/security/credentials.h>
 #include <grpcpp/support/channel_arguments.h>
+
+namespace ProfileEvents
+{
+    extern const Event InodeDBCommit;
+    extern const Event InodeDBStat;
+    extern const Event InodeDBRead;
+    extern const Event InodeDBList;
+    extern const Event InodeDBClaimFreed;
+    extern const Event InodeDBAckFreed;
+    extern const Event InodeDBMintKey;
+    extern const Event InodeDBRetries;
+    extern const Event InodeDBMicroseconds;
+}
 
 namespace DB
 {
@@ -116,8 +132,12 @@ Client::ChannelPtr Client::currentChannel() const
 }
 
 template <typename Attempt>
-void Client::invoke(std::string_view method, Attempt && attempt) const
+void Client::invoke(std::string_view method, ProfileEvents::Event event, Attempt && attempt) const
 {
+    ProfileEvents::increment(event);
+    Stopwatch watch;
+    SCOPE_EXIT({ ProfileEvents::increment(ProfileEvents::InodeDBMicroseconds, watch.elapsedMicroseconds()); });
+
     const auto give_up_at = std::chrono::steady_clock::now() + settings.retry_timeout;
     UInt64 backoff_ms = 5;
 
@@ -157,6 +177,7 @@ void Client::invoke(std::string_view method, Attempt && attempt) const
             throwStatus(method, current->target, status, inodedb_error);
         }
 
+        ProfileEvents::increment(ProfileEvents::InodeDBRetries);
         sleepForMilliseconds(backoff_ms);
         backoff_ms = std::min<UInt64>(backoff_ms * 2, 1000);
     }
@@ -166,7 +187,7 @@ pb::CommitResponse Client::commit(pb::CommitRequest request) const
 {
     request.set_request_id(newRequestId());
     pb::CommitResponse response;
-    invoke("Commit", [&](pb::InodeDB::Stub & stub, grpc::ClientContext & context)
+    invoke("Commit", ProfileEvents::InodeDBCommit, [&](pb::InodeDB::Stub & stub, grpc::ClientContext & context)
     {
         response.Clear();
         return stub.Commit(&context, request, &response);
@@ -177,7 +198,7 @@ pb::CommitResponse Client::commit(pb::CommitRequest request) const
 pb::StatResponse Client::stat(const pb::StatRequest & request) const
 {
     pb::StatResponse response;
-    invoke("Stat", [&](pb::InodeDB::Stub & stub, grpc::ClientContext & context)
+    invoke("Stat", ProfileEvents::InodeDBStat, [&](pb::InodeDB::Stub & stub, grpc::ClientContext & context)
     {
         response.Clear();
         return stub.Stat(&context, request, &response);
@@ -188,7 +209,7 @@ pb::StatResponse Client::stat(const pb::StatRequest & request) const
 pb::ReadResponse Client::read(const pb::ReadRequest & request) const
 {
     pb::ReadResponse response;
-    invoke("Read", [&](pb::InodeDB::Stub & stub, grpc::ClientContext & context)
+    invoke("Read", ProfileEvents::InodeDBRead, [&](pb::InodeDB::Stub & stub, grpc::ClientContext & context)
     {
         response.Clear();
         return stub.Read(&context, request, &response);
@@ -199,7 +220,7 @@ pb::ReadResponse Client::read(const pb::ReadRequest & request) const
 Listing Client::list(pb::ListRequest request) const
 {
     Listing listing;
-    invoke("List", [&](pb::InodeDB::Stub & stub, grpc::ClientContext & context)
+    invoke("List", ProfileEvents::InodeDBList, [&](pb::InodeDB::Stub & stub, grpc::ClientContext & context)
     {
         /// A retry resumes after the last entry, in the directory the first page named.
         if (!listing.entries.empty())
@@ -228,7 +249,7 @@ pb::ClaimResponse Client::claimFreed(uint32_t limit) const
     pb::ClaimRequest request;
     request.set_limit(limit);
     pb::ClaimResponse response;
-    invoke("ClaimFreed", [&](pb::InodeDB::Stub & stub, grpc::ClientContext & context)
+    invoke("ClaimFreed", ProfileEvents::InodeDBClaimFreed, [&](pb::InodeDB::Stub & stub, grpc::ClientContext & context)
     {
         response.Clear();
         return stub.ClaimFreed(&context, request, &response);
@@ -239,7 +260,7 @@ pb::ClaimResponse Client::claimFreed(uint32_t limit) const
 void Client::ackFreed(const pb::AckRequest & request) const
 {
     pb::AckResponse response;
-    invoke("AckFreed", [&](pb::InodeDB::Stub & stub, grpc::ClientContext & context)
+    invoke("AckFreed", ProfileEvents::InodeDBAckFreed, [&](pb::InodeDB::Stub & stub, grpc::ClientContext & context)
     {
         return stub.AckFreed(&context, request, &response);
     });
@@ -290,7 +311,7 @@ void LeaseStream::cancel()
 pb::MintKeyResponse Client::mintKey(const pb::MintKeyRequest & request) const
 {
     pb::MintKeyResponse response;
-    invoke("MintKey", [&](pb::InodeDB::Stub & stub, grpc::ClientContext & context)
+    invoke("MintKey", ProfileEvents::InodeDBMintKey, [&](pb::InodeDB::Stub & stub, grpc::ClientContext & context)
     {
         response.Clear();
         return stub.MintKey(&context, request, &response);
