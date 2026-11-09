@@ -1,0 +1,15 @@
+BigHouse
+
+Copyright (c) 2026 Dan Goodman. All rights reserved.
+
+This branch adds BigHouse's InodeDB metadata type to ClickHouse. No license
+is granted for BigHouse's work, which is:
+
+- every file under src/Disks/DiskObjectStorage/MetadataStorages/InodeDB/;
+- every file under rust/workspace/inodedb/;
+- the changes that BigHouse's commits on the bighouse branch make to other
+  files.
+
+The Apache License 2.0 in LICENSE covers ClickHouse's code only, including the
+unchanged parts of files BigHouse modifies. Each ClickHouse file that BigHouse
+modifies carries a notice saying so.
