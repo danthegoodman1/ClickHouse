@@ -286,6 +286,8 @@ private:
     };
 
     AttemptResult attempt(bool read_state, bool & frees);
+    /// Whether every intent creates a directory that exists already, so the transaction changes nothing.
+    bool onlyCreatesExistingDirectories() const;
 
     MetadataStorageFromInodeDB & storage;
     std::vector<Intent> intents;

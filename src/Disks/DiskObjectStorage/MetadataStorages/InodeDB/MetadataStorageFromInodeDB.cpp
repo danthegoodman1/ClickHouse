@@ -1691,6 +1691,10 @@ void MetadataStorageFromInodeDBTransaction::commit(const TransactionCommitOption
         throwNotImplemented();
     if (intents.empty())
         return;
+    /// `DiskObjectStorage::createDirectories` commits even for directories that exist, as when a replica attaches a
+    /// database from this disk. Such a transaction changes nothing, so a read-only disk commits it, as `local` does.
+    if (storage.isReadOnly() && onlyCreatesExistingDirectories())
+        return;
     storage.assertWritable();
 
     bool read_state = std::ranges::any_of(intents, [](const Intent & intent) { return intent.readsState(); });
@@ -1722,6 +1726,15 @@ void MetadataStorageFromInodeDBTransaction::commit(const TransactionCommitOption
     {
         tryLogCurrentException(storage.log, "Claiming freed files after a commit");
     }
+}
+
+bool MetadataStorageFromInodeDBTransaction::onlyCreatesExistingDirectories() const
+{
+    return std::ranges::all_of(intents, [this](const Intent & intent)
+    {
+        return (intent.kind == IntentKind::CreateDirectory || intent.kind == IntentKind::CreateDirectoryRecursive)
+            && storage.existsDirectory(intent.path);
+    });
 }
 
 TransactionCommitOutcomeVariant MetadataStorageFromInodeDBTransaction::tryCommit(const TransactionCommitOptionsVariant & options)

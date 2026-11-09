@@ -26,6 +26,11 @@
 
 namespace fs = std::filesystem;
 
+namespace DB::ErrorCodes
+{
+extern const int TABLE_IS_READ_ONLY;
+}
+
 /// BigHouse: every case runs against `local` metadata and against `inodedb` metadata, which must match it.
 /// The `inodedb` cases need an InodeDB server: `INODEDB_TEST_ENDPOINT` and an admin key in `INODEDB_TEST_KEY`.
 class MetadataDiskTest : public testing::TestWithParam<std::string>
@@ -56,6 +61,27 @@ public:
         std::unique_lock<std::mutex> lock(active_metadatas_mutex);
         return object_storages.at(path);
     }
+
+#if USE_GRPC
+    /// A replica of the `inodedb` storage at `path`: a read-only storage over the same tree, with a read key.
+    std::shared_ptr<DB::IMetadataStorage> getInodeDBReplica(const std::string & path)
+    {
+        getMetadataStorage(path);
+        std::unique_lock<std::mutex> lock(active_metadatas_mutex);
+        const std::string endpoint = getenv("INODEDB_TEST_ENDPOINT");
+        DB::InodeDB::Client admin({.endpoint = endpoint, .key = getenv("INODEDB_TEST_KEY")});
+        DB::InodeDB::pb::MintKeyRequest mint;
+        mint.set_root(inodedb_roots.at(path));
+        mint.set_grant(DB::InodeDB::pb::READ);
+        auto replica = std::make_shared<DB::MetadataStorageFromInodeDB>(
+            std::make_shared<DB::InodeDB::Client>(DB::InodeDB::ClientSettings{.endpoint = endpoint, .key = admin.mintKey(mint).key()}),
+            object_storages.at(path), path, DB::createObjectStorageKeyGeneratorByTemplate("[a-z]{32}"),
+            DB::InodeDBMetadataSettings{.read_only = true});
+        replica->startup();
+        active_metadatas[path + "#replica"] = replica;
+        return replica;
+    }
+#endif
 
     std::shared_ptr<DB::IDisk> getMetadataDisk(const std::string & path)
     {
@@ -89,6 +115,7 @@ private:
             /// Each storage gets a key rooted at a directory of its own.
             DB::InodeDB::Client admin({.endpoint = endpoint, .key = getenv("INODEDB_TEST_KEY")});
             const std::string root = "gtest/" + DB::getRandomASCIIString(16);
+            inodedb_roots[path] = root;
             DB::InodeDB::pb::CommitRequest mkdir;
             auto * op = mkdir.add_ops()->mutable_mkdir();
             op->set_path(root);
@@ -127,6 +154,7 @@ private:
     std::unordered_map<std::string, std::shared_ptr<DB::IDisk>> active_disks;
     std::vector<std::string> object_storage_dirs;
     std::unordered_map<std::string, DB::ObjectStoragePtr> object_storages;
+    std::unordered_map<std::string, std::string> inodedb_roots;
 };
 
 INSTANTIATE_TEST_SUITE_P(Metadata, MetadataDiskTest, testing::Values("local", "inodedb"), [](const testing::TestParamInfo<std::string> & param_info) { return param_info.param; });
@@ -1540,6 +1568,53 @@ static std::set<std::string> drainBlobsToRemove(const DB::MetadataStoragePtr & m
     }
     metadata->recordAsRemoved(objects);
     return keys;
+}
+
+/// BigHouse: attaching a database from a read-only disk runs `createDirectories` on paths that exist. A replica
+/// commits such a transaction, as `local` metadata does, and refuses any transaction that changes the tree.
+TEST_P(MetadataDiskTest, TestReplicaCreatesExistingDirectories)
+{
+    if (GetParam() != "inodedb")
+        GTEST_SKIP() << "only `inodedb` metadata has replicas";
+#if USE_GRPC
+    auto writer = getMetadataStorage("/TestReplicaCreatesExistingDirectories");
+    {
+        auto transaction = writer->createTransaction();
+        transaction->createDirectoryRecursive("store/abc/database");
+        transaction->commit(DB::NoCommitOptions{});
+    }
+
+    auto replica = getInodeDBReplica("/TestReplicaCreatesExistingDirectories");
+    {
+        auto transaction = replica->createTransaction();
+        transaction->createDirectoryRecursive("store/abc/database");
+        transaction->createDirectory("store/abc");
+        EXPECT_NO_THROW(transaction->commit(DB::NoCommitOptions{}));
+    }
+
+    auto expect_read_only = [&](auto && change)
+    {
+        auto transaction = replica->createTransaction();
+        change(*transaction);
+        try
+        {
+            transaction->commit(DB::NoCommitOptions{});
+            ADD_FAILURE() << "a replica committed a change";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::TABLE_IS_READ_ONLY) << e.message();
+        }
+    };
+    expect_read_only([](auto & transaction) { transaction.createDirectory("store/new"); });
+    expect_read_only([](auto & transaction)
+    {
+        transaction.createDirectoryRecursive("store/abc/database");
+        transaction.writeStringToFile("store/abc/database/t.sql", "ATTACH TABLE _");
+    });
+    EXPECT_FALSE(writer->existsFileOrDirectory("store/new"));
+    EXPECT_FALSE(writer->existsFileOrDirectory("store/abc/database/t.sql"));
+#endif
 }
 
 /// BigHouse: `inodedb` writes inline files as rewrites, as `MetadataStorageFromMemory` does. It also supports
