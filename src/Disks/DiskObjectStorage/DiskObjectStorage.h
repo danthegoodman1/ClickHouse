@@ -53,10 +53,12 @@ public:
 
     /// Keeper metadata replicates itself; in-memory metadata is transient and has no local
     /// metadata files zero-copy could ship (see `getReplicatedFilesDescriptionForRemoteDisk`).
+    /// BigHouse: InodeDB metadata keeps no local files either; its replicas share one tree instead.
     bool supportZeroCopyReplication() const override
     {
         return metadata_storage->getType() != MetadataStorageType::Keeper
-            && metadata_storage->getType() != MetadataStorageType::Memory;
+            && metadata_storage->getType() != MetadataStorageType::Memory
+            && metadata_storage->getType() != MetadataStorageType::InodeDB;
     }
 
     bool supportParallelWrite() const override { return object_storages->takePointingTo(cluster->getLocalLocation())->supportParallelWrite(); }
