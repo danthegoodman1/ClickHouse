@@ -6,7 +6,6 @@ This branch adds BigHouse's InodeDB metadata type to ClickHouse. No license
 is granted for BigHouse's work, which is:
 
 - every file under src/Disks/DiskObjectStorage/MetadataStorages/InodeDB/;
-- every file under rust/workspace/inodedb/;
 - the changes that BigHouse's commits on the bighouse branch make to other
   files.
 

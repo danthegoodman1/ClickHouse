@@ -1,0 +1,406 @@
+// Copied from github.com/danthegoodman1/inodedb at dc97a2c (proto/inodedb.proto).
+// InodeDB's API. Paths are bytes: names joined by `/`, resolved from the
+// root of the caller's key. Every response carries the version it reflects.
+syntax = "proto3";
+
+package inodedb.v1;
+
+service InodeDB {
+  // One batch, applied as one transaction.
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc Stat(StatRequest) returns (StatResponse);
+  rpc Read(ReadRequest) returns (ReadResponse);
+  // One directory's entries in name order, in pages.
+  rpc List(ListRequest) returns (stream ListPage);
+  // A subtree's changes, in version order.
+  rpc Watch(WatchRequest) returns (stream Change);
+  rpc Lease(stream LeaseBeat) returns (stream LeaseState);
+  rpc ClaimFreed(ClaimRequest) returns (ClaimResponse);
+  rpc AckFreed(AckRequest) returns (AckResponse);
+  rpc MintKey(MintKeyRequest) returns (MintKeyResponse);
+  rpc RevokeKey(RevokeKeyRequest) returns (RevokeKeyResponse);
+  // Checks the store's invariants over one snapshot, as `fsck`. It reads
+  // the whole store, so it takes an admin key rooted at the tree's root.
+  rpc Check(CheckRequest) returns (CheckResponse);
+}
+
+// An inode, bound to the key that received it.
+message Handle {
+  uint64 ino = 1;
+  bytes mac = 2;
+}
+
+enum Kind {
+  DIR = 0;
+  FILE = 1;
+}
+
+enum Life {
+  LIVE = 0;
+  DETACHED = 1;
+  FREED = 2;
+}
+
+enum Error {
+  ERROR_UNSPECIFIED = 0;
+  NOT_FOUND = 1;
+  EXISTS = 2;
+  NOT_DIR = 3;
+  IS_DIR = 4;
+  NOT_EMPTY = 5;
+  INVALID = 6;
+  TOO_LARGE = 7;
+}
+
+message Inode {
+  Handle handle = 1;
+  Kind kind = 2;
+  uint64 version = 3;
+  uint64 mtime = 4;
+  uint32 mode = 5;
+  uint32 nlink = 6;
+  uint64 size = 7;
+  // The version a file's current value is stored under.
+  uint64 value_version = 8;
+  Life life = 9;
+}
+
+// Predicates in a condition.
+message Pred {
+  oneof kind {
+    bytes exists = 1;
+    bytes absent = 2;
+    bytes is_file = 3;
+    bytes is_dir = 4;
+    bytes empty = 5;
+    VersionIs version_is = 6;
+    // An earlier op in the batch applied.
+    uint32 applied = 7;
+  }
+}
+
+message VersionIs {
+  bytes path = 1;
+  uint64 version = 2;
+}
+
+enum PutMode {
+  UPSERT = 0;
+  CREATE = 1;
+  REPLACE = 2;
+}
+
+enum RenameFlag {
+  REPLACE_TARGET = 0;
+  NO_REPLACE = 1;
+  EXCHANGE = 2;
+}
+
+message Op {
+  oneof kind {
+    Mkdir mkdir = 1;
+    Put put = 2;
+    Link link = 3;
+    Unlink unlink = 4;
+    Rmdir rmdir = 5;
+    RemoveAll remove_all = 6;
+    Rename rename = 7;
+    SetAttr set_attr = 8;
+  }
+  repeated Pred cond = 15;
+}
+
+message Mkdir {
+  bytes path = 1;
+  bool parents = 2;
+  bool if_absent = 3;
+}
+
+message Put {
+  bytes path = 1;
+  bytes value = 2;
+  PutMode mode = 3;
+  optional uint64 mtime = 4;
+}
+
+message Link {
+  bytes from = 1;
+  bytes to = 2;
+}
+
+message Unlink {
+  bytes path = 1;
+  bool if_exists = 2;
+}
+
+message Rmdir {
+  bytes path = 1;
+  bool if_exists = 2;
+}
+
+message RemoveAll {
+  bytes path = 1;
+  bool if_exists = 2;
+}
+
+message Rename {
+  bytes from = 1;
+  bytes to = 2;
+  RenameFlag flag = 3;
+}
+
+message SetAttr {
+  bytes path = 1;
+  optional uint64 mtime = 2;
+  optional uint32 mode = 3;
+}
+
+message CommitRequest {
+  repeated Op ops = 1;
+  // Predicates joined to every op's condition.
+  repeated Pred when = 2;
+  bool all_or_nothing = 3;
+  // 16 bytes; a retry with the same id gets the first answer.
+  bytes request_id = 4;
+}
+
+message Outcome {
+  oneof kind {
+    Applied applied = 1;
+    Skipped skipped = 2;
+  }
+}
+
+message Applied {
+  optional Handle handle = 1;
+}
+
+message Skipped {
+  oneof reason {
+    // The batch's `when` predicate at this index.
+    uint32 when = 1;
+    // The op's own predicate at this index.
+    uint32 cond = 2;
+    Error error = 3;
+    // Another op in an all-or-nothing batch was skipped.
+    bool aborted = 4;
+  }
+}
+
+message CommitResponse {
+  // The commit's version, or the version a batch that changed nothing saw.
+  uint64 version = 1;
+  bool committed = 2;
+  repeated Outcome outcomes = 3;
+}
+
+// How fresh a read must be.
+message ReadAt {
+  // Zero reads the newest committed state.
+  uint64 at_least = 1;
+}
+
+message Target {
+  oneof kind {
+    bytes path = 1;
+    Handle handle = 2;
+  }
+}
+
+message StatRequest {
+  repeated Target targets = 1;
+  ReadAt at = 2;
+}
+
+message StatResult {
+  oneof kind {
+    Inode inode = 1;
+    Error error = 2;
+  }
+}
+
+message StatResponse {
+  uint64 version = 1;
+  repeated StatResult results = 2;
+}
+
+message ReadTarget {
+  Target target = 1;
+  // A value's version, for an old value; unset reads the current one.
+  optional uint64 value_version = 2;
+}
+
+message ReadRequest {
+  repeated ReadTarget targets = 1;
+  ReadAt at = 2;
+}
+
+message Value {
+  Inode inode = 1;
+  bytes value = 2;
+}
+
+message ReadResult {
+  oneof kind {
+    Value value = 1;
+    Error error = 2;
+  }
+}
+
+message ReadResponse {
+  uint64 version = 1;
+  repeated ReadResult results = 2;
+}
+
+message ListRequest {
+  bytes path = 1;
+  // Lists this directory instead of `path`'s, as when resuming a listing.
+  optional Handle dir = 8;
+  optional bytes after = 2;
+  optional bytes prefix = 3;
+  // Entries in all; zero lists every entry.
+  uint64 limit = 4;
+  bool attrs = 5;
+  bool values = 6;
+  ReadAt at = 7;
+}
+
+message Listed {
+  bytes name = 1;
+  Kind kind = 2;
+  Handle handle = 3;
+  // The version that created the entry.
+  uint64 entry_version = 4;
+  // The child's inode, without a handle: its handle is `handle`.
+  optional Inode inode = 5;
+  optional bytes value = 6;
+}
+
+message ListPage {
+  uint64 version = 1;
+  repeated Listed entries = 2;
+  // More entries follow this page.
+  bool more = 3;
+  optional Error error = 4;
+  // The directory listed: every page lists the one the first page did.
+  Handle dir = 5;
+}
+
+message WatchRequest {
+  // A directory; the stream follows it by inode through renames.
+  bytes path = 1;
+  // The first version to send; zero starts after the current one.
+  uint64 from = 2;
+}
+
+message EntryChange {
+  Handle dir = 1;
+  bytes name = 2;
+  optional Listed before = 3;
+  optional Listed after = 4;
+}
+
+message InodeChange {
+  Handle handle = 1;
+  // The inode before and after the change, without handles: theirs is
+  // `handle`.
+  optional Inode before = 2;
+  optional Inode after = 3;
+  repeated Handle holders = 4;
+}
+
+message Change {
+  uint64 version = 1;
+  uint64 time = 2;
+  repeated EntryChange entries = 3;
+  repeated InodeChange inodes = 4;
+  // Directories renamed into the subtree, whose contents the subscriber
+  // has never seen.
+  repeated Handle entered = 5;
+  // The log no longer holds `version`, the position asked for; the
+  // subscriber starts over, and the stream ends.
+  bool compacted = 6;
+}
+
+message LeaseBeat {
+  // Zero opens a lease.
+  uint64 lease = 1;
+  // The oldest version the reader still uses.
+  uint64 oldest = 2;
+  // The reader's changefeed position.
+  uint64 position = 3;
+  // Ends the lease.
+  bool release = 4;
+  // Opens the lease at the newest committed version, which the state
+  // reports, in place of `oldest` and `position`.
+  bool current = 5;
+}
+
+message LeaseState {
+  uint64 lease = 1;
+  uint64 expires_in_ms = 2;
+  // The lease ran out; the reader must drop its handles and reload.
+  bool expired = 3;
+  // The oldest version the lease holds.
+  uint64 oldest = 4;
+}
+
+message Freed {
+  uint64 version = 1;
+  Handle handle = 2;
+  // The value's version when a value was freed.
+  optional uint64 value_version = 3;
+  Inode inode = 4;
+  optional bytes value = 5;
+}
+
+message ClaimRequest {
+  uint32 limit = 1;
+}
+
+message ClaimResponse {
+  uint64 claim = 1;
+  repeated Freed freed = 2;
+}
+
+message AckRequest {
+  uint64 claim = 1;
+  repeated Freed freed = 2;
+}
+
+message AckResponse {}
+
+enum Grant {
+  READ = 0;
+  WRITE = 1;
+  ADMIN = 2;
+}
+
+message MintKeyRequest {
+  bytes root = 1;
+  Grant grant = 2;
+  // Zero lasts as long as the minting key.
+  uint64 ttl_ms = 3;
+}
+
+message MintKeyResponse {
+  // `<id>.<secret>`.
+  string key = 1;
+}
+
+message RevokeKeyRequest {
+  string id = 1;
+}
+
+message RevokeKeyResponse {}
+
+message CheckRequest {}
+
+message CheckResponse {
+  // The version the snapshot reflects.
+  uint64 version = 1;
+  // How many keys it read.
+  uint64 keys = 2;
+  // Each invariant the store breaks; none for a sound store.
+  repeated string problems = 3;
+}

@@ -3528,8 +3528,9 @@ catch (...)
 }
 
 /// Re-scan the data directory once: reload disk metadata and add parts that appeared since the
-/// last scan (it does not detect parts that vanished from disk; `grabOldParts` only cleans up
-/// parts already marked outdated). Shared by the background refresh task (which reschedules
+/// last scan. On disks with `inodedb` metadata, whose listings are exact, active parts that vanished
+/// from the listing become outdated too; elsewhere `grabOldParts` only cleans up parts already
+/// marked outdated. Shared by the background refresh task (which reschedules
 /// itself afterwards) and by `SYSTEM RESTART DISK` (an explicit, one-shot refresh). The two
 /// callers are serialized so they cannot load the same new part concurrently.
 void MergeTreeData::refreshDataPartsOnce(UInt64 interval_milliseconds)
@@ -3553,12 +3554,20 @@ void MergeTreeData::refreshDataPartsOnce(UInt64 interval_milliseconds)
     auto disks = getStoragePolicy()->getDisks();
     PartLoadingTree::PartLoadingInfos parts_to_load;
 
+    /// BigHouse: the parts listed on disks with exact listings (`inodedb` metadata), to find vanished ones.
+    bool listings_are_exact = true;
+    NameSet listed_part_names;
+
     for (const auto & disk_ptr : disks)
     {
         if (disk_ptr->isBroken())
+        {
+            listings_are_exact = false;
             continue;
+        }
         if (!disk_ptr->isReadOnly())
             throw Exception(ErrorCodes::LOGICAL_ERROR, "MergeTreeData::refreshDataPartsOnce should only be called if all disks are readonly");
+        listings_are_exact &= disk_ptr->getDataSourceDescription().metadata_type == MetadataStorageType::InodeDB;
 
         for (auto it = disk_ptr->iterateDirectory(relative_data_path); it->isValid(); it->next())
         {
@@ -3569,7 +3578,26 @@ void MergeTreeData::refreshDataPartsOnce(UInt64 interval_milliseconds)
                 continue;
 
             if (auto part_info = MergeTreePartInfo::tryParsePartName(it->name(), format_version))
+            {
+                listed_part_names.insert(it->name());
                 parts_to_load.emplace_back(*part_info, it->name(), disk_ptr);
+            }
+        }
+    }
+
+    /// BigHouse: an active part missing from an exact listing was dropped or merged away by the writer.
+    /// Queries reading it keep it until they finish; the reader's InodeDB lease keeps its blobs.
+    if (listings_are_exact)
+    {
+        auto part_lock = lockParts();
+        DataPartsVector vanished;
+        for (const auto & part : getDataPartsStateRange(DataPartState::Active))
+            if (!listed_part_names.contains(part->name))
+                vanished.push_back(part);
+        if (!vanished.empty())
+        {
+            LOG_DEBUG(log, "{} active parts vanished from the disk, e.g. {}", vanished.size(), vanished.front()->name);
+            removePartsFromWorkingSet(nullptr, vanished, /*clear_without_timeout=*/ true, part_lock);
         }
     }
 
@@ -9342,6 +9370,8 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                 case MetadataStorageType::Local:
                 case MetadataStorageType::Keeper:
                 case MetadataStorageType::Memory:
+                /// BigHouse: InodeDB metadata supports every partition operation `local` metadata does.
+                case MetadataStorageType::InodeDB:
                 {
                     can_execute_alter_on_disk = true;
                     break;

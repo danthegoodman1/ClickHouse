@@ -8,6 +8,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/PlainRewritable/MetadataStorageFromPlainRewritableObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/Web/MetadataStorageFromIndexPages.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/Web/MetadataStorageFromStaticFilesWebServer.h>
+/// BigHouse: the InodeDB metadata type registers itself from its own directory.
+#include <Disks/DiskObjectStorage/MetadataStorages/InodeDB/registerMetadataStorageFromInodeDB.h>
 #include <Disks/DiskLocal.h>
 #include <Disks/loadLocalDiskConfig.h>
 #include <Interpreters/Context.h>
@@ -277,6 +279,8 @@ void registerMetadataStorages()
 #if CLICKHOUSE_CLOUD
     registerMetadataStorageFromKeeper(factory);
 #endif
+    /// BigHouse: the InodeDB metadata type.
+    registerMetadataStorageFromInodeDB(factory);
 }
 
 void MetadataStorageFactory::clearRegistry()

@@ -35,6 +35,8 @@ enum class MetadataStorageType : uint8_t
     StaticWeb,
     WebIndex,
     Memory,
+    /// BigHouse: the file tree lives in InodeDB (`MetadataStorages/InodeDB`).
+    InodeDB,
 };
 
 MetadataStorageType metadataTypeFromString(const String & type);

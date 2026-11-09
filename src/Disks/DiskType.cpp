@@ -30,6 +30,9 @@ MetadataStorageType metadataTypeFromString(const String & type)
         return MetadataStorageType::Keeper;
     if (check_type == "memory")
         return MetadataStorageType::Memory;
+    /// BigHouse: the InodeDB metadata type.
+    if (check_type == "inodedb")
+        return MetadataStorageType::InodeDB;
 
     throw Exception(ErrorCodes::UNKNOWN_ELEMENT_IN_CONFIG,
                     "MetadataStorageFactory: unknown metadata storage type: {}", type);

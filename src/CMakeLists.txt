@@ -180,6 +180,8 @@ add_headers_and_sources(dbms Disks/DiskObjectStorage/MetadataStorages/PlainRewri
 add_headers_and_sources(dbms Disks/DiskObjectStorage/MetadataStorages/PlainRewritable/Metadata)
 add_headers_and_sources(dbms Disks/DiskObjectStorage/MetadataStorages/PlainRewritable/Transactions)
 add_headers_and_sources(dbms Disks/DiskObjectStorage/MetadataStorages/Web)
+# BigHouse: the InodeDB metadata type. Its sources compile to nothing without gRPC.
+add_headers_and_sources(dbms Disks/DiskObjectStorage/MetadataStorages/InodeDB)
 if (TARGET ch_contrib::sqlite)
     add_headers_and_sources(dbms Databases/SQLite)
 endif()
@@ -848,6 +850,12 @@ endif ()
 
 if (TARGET clickhouse_grpc_protos)
     target_link_libraries(dbms PUBLIC clickhouse_grpc_protos)
+endif()
+
+# BigHouse: the InodeDB metadata type's gRPC client.
+if (TARGET ch_contrib::grpc)
+    add_subdirectory (Disks/DiskObjectStorage/MetadataStorages/InodeDB/proto)
+    target_link_libraries(dbms PUBLIC clickhouse_inodedb_protos)
 endif()
 
 if (TARGET ch_contrib::hdfs)

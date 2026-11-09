@@ -7,6 +7,9 @@
 #include <Core/ServerUUID.h>
 #include <Disks/DiskLocal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/Local/MetadataStorageFromDisk.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/InodeDB/MetadataStorageFromInodeDB.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+#include "config.h"
 #include <Common/ObjectStorageKeyGenerator.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Common/tests/gtest_global_register.h>
@@ -23,12 +26,21 @@
 
 namespace fs = std::filesystem;
 
-class MetadataLocalDiskTest : public testing::Test
+/// BigHouse: every case runs against `local` metadata and against `inodedb` metadata, which must match it.
+/// The `inodedb` cases need an InodeDB server: `INODEDB_TEST_ENDPOINT` and an admin key in `INODEDB_TEST_KEY`.
+class MetadataDiskTest : public testing::TestWithParam<std::string>
 {
 public:
     void SetUp() override
     {
         DB::ServerUUID::setRandomForUnitTests();
+#if USE_GRPC
+        if (GetParam() == "inodedb" && (!getenv("INODEDB_TEST_ENDPOINT") || !getenv("INODEDB_TEST_KEY")))
+            GTEST_SKIP() << "Set INODEDB_TEST_ENDPOINT and INODEDB_TEST_KEY to run the inodedb cases";
+#else
+        if (GetParam() == "inodedb")
+            GTEST_SKIP() << "Built without gRPC";
+#endif
     }
 
     std::shared_ptr<DB::IMetadataStorage> getMetadataStorage(const std::string & path)
@@ -53,17 +65,52 @@ public:
 
         for (const auto & [_, disk] : active_disks)
             fs::remove_all(disk->getPath());
+
+        for (const auto & dir : object_storage_dirs)
+            fs::remove_all(dir);
     }
 
 private:
     std::shared_ptr<DB::IMetadataStorage> createMetadataStorage(const std::string & path)
     {
+        auto key_generator = DB::createObjectStorageKeyGeneratorByTemplate("[a-z]{32}");
+
+#if USE_GRPC
+        if (GetParam() == "inodedb")
+        {
+            const std::string endpoint = getenv("INODEDB_TEST_ENDPOINT");
+
+            /// Each storage gets a key rooted at a directory of its own.
+            DB::InodeDB::Client admin({.endpoint = endpoint, .key = getenv("INODEDB_TEST_KEY")});
+            const std::string root = "gtest/" + DB::getRandomASCIIString(16);
+            DB::InodeDB::pb::CommitRequest mkdir;
+            auto * op = mkdir.add_ops()->mutable_mkdir();
+            op->set_path(root);
+            op->set_parents(true);
+            admin.commit(mkdir);
+            DB::InodeDB::pb::MintKeyRequest mint;
+            mint.set_root(root);
+            mint.set_grant(DB::InodeDB::pb::WRITE);
+            auto key = admin.mintKey(mint).key();
+
+            const auto object_storage_dir = fs::absolute("./test-object-storage-dir." + DB::getRandomASCIIString(6)).string();
+            fs::create_directories(object_storage_dir);
+            object_storage_dirs.push_back(object_storage_dir);
+            auto object_storage = std::make_shared<DB::LocalObjectStorage>(DB::LocalObjectStorageSettings("test", object_storage_dir, /*read_only_=*/ false));
+
+            auto metadata = std::make_shared<DB::MetadataStorageFromInodeDB>(
+                std::make_shared<DB::InodeDB::Client>(DB::InodeDB::ClientSettings{.endpoint = endpoint, .key = key}),
+                object_storage, path, key_generator, DB::InodeDBMetadataSettings{});
+            metadata->startup();
+            return metadata;
+        }
+#endif
+
         const auto local_disk_metadata_dir = "./test-metadata-dir." + DB::getRandomASCIIString(6);
         fs::create_directories(local_disk_metadata_dir);
 
         auto disk = active_disks[path] = std::make_shared<DB::DiskLocal>("test-metadata", local_disk_metadata_dir);
-        auto key_generator = DB::createObjectStorageKeyGeneratorByTemplate("[a-z]{32}");
-        auto metadata = active_metadatas[path] = std::make_shared<DB::MetadataStorageFromDisk>(disk, path, key_generator, /*persist_removal_queue_=*/true, /*removal_log_compaction_threshold_=*/1000);
+        auto metadata = std::make_shared<DB::MetadataStorageFromDisk>(disk, path, key_generator, /*persist_removal_queue_=*/true, /*removal_log_compaction_threshold_=*/1000);
 
         return metadata;
     }
@@ -71,7 +118,10 @@ private:
     std::mutex active_metadatas_mutex;
     std::unordered_map<std::string, std::shared_ptr<DB::IMetadataStorage>> active_metadatas;
     std::unordered_map<std::string, std::shared_ptr<DB::IDisk>> active_disks;
+    std::vector<std::string> object_storage_dirs;
 };
+
+INSTANTIATE_TEST_SUITE_P(Metadata, MetadataDiskTest, testing::Values("local", "inodedb"), [](const testing::TestParamInfo<std::string> & param_info) { return param_info.param; });
 
 static void verifyBlobsToRemove(const DB::MetadataStoragePtr & metadata, std::set<std::string> expected_blobs)
 {
@@ -89,7 +139,7 @@ static void verifyBlobsToRemove(const DB::MetadataStoragePtr & metadata, std::se
     EXPECT_EQ(remote_paths, expected_blobs);
 }
 
-TEST_F(MetadataLocalDiskTest, TestHardlinkRewrite)
+TEST_P(MetadataDiskTest, TestHardlinkRewrite)
 {
     auto metadata = getMetadataStorage("/TestHardlinkRewrite");
 
@@ -138,7 +188,7 @@ TEST_F(MetadataLocalDiskTest, TestHardlinkRewrite)
     EXPECT_EQ(original_blobs[0].bytes_size, 222);
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsWrite)
+TEST_P(MetadataDiskTest, TestValidSingleOperationsWrite)
 {
     auto metadata = getMetadataStorage("/TestValidSingleOperationsWrite");
 
@@ -152,7 +202,7 @@ TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsWrite)
     EXPECT_FALSE(metadata->existsDirectory("f.txt"));
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidAddBlob)
+TEST_P(MetadataDiskTest, TestValidAddBlob)
 {
     auto metadata = getMetadataStorage("/TestValidAddBlob");
 
@@ -234,7 +284,7 @@ TEST_F(MetadataLocalDiskTest, TestValidAddBlob)
     EXPECT_EQ(blobs_fff[5].bytes_size, 800);
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidCreateMetadataAddBlob)
+TEST_P(MetadataDiskTest, TestValidCreateMetadataAddBlob)
 {
     auto metadata = getMetadataStorage("/TestValidCreateMetadataAddBlob");
 
@@ -277,7 +327,7 @@ TEST_F(MetadataLocalDiskTest, TestValidCreateMetadataAddBlob)
 }
 
 
-TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsMove)
+TEST_P(MetadataDiskTest, TestValidSingleOperationsMove)
 {
     auto metadata = getMetadataStorage("/TestValidSingleOperationsMove");
 
@@ -296,7 +346,7 @@ TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsMove)
     EXPECT_FALSE(metadata->existsFile("f.txt"));
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsHardlink)
+TEST_P(MetadataDiskTest, TestValidSingleOperationsHardlink)
 {
 
     auto metadata = getMetadataStorage("/TestValidSingleOperationsHardlink");
@@ -317,7 +367,7 @@ TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsHardlink)
     EXPECT_EQ(metadata->readInlineDataToString("g1.txt"), "hello");
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsReplace)
+TEST_P(MetadataDiskTest, TestValidSingleOperationsReplace)
 {
     auto metadata = getMetadataStorage("/TestValidSingleOperationsReplace");
     {
@@ -337,7 +387,7 @@ TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsReplace)
     EXPECT_EQ(metadata->readInlineDataToString("g.txt"), "world");
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsRemove)
+TEST_P(MetadataDiskTest, TestValidSingleOperationsRemove)
 {
     auto metadata = getMetadataStorage("/TestValidSingleOperationsRemove");
     {
@@ -354,7 +404,7 @@ TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsRemove)
     EXPECT_FALSE(metadata->existsFile("g.txt"));
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidUnlinkMetadata)
+TEST_P(MetadataDiskTest, TestValidUnlinkMetadata)
 {
     auto metadata = getMetadataStorage("/TestValidUnlinkMetadata");
     {
@@ -412,7 +462,7 @@ TEST_F(MetadataLocalDiskTest, TestValidUnlinkMetadata)
     }
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsCreateDirectory)
+TEST_P(MetadataDiskTest, TestValidSingleOperationsCreateDirectory)
 {
     auto metadata = getMetadataStorage("/TestValidSingleOperationsCreateDirectory");
     auto transaction = metadata->createTransaction();
@@ -424,7 +474,7 @@ TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsCreateDirectory)
     EXPECT_FALSE(metadata->existsFile("testdir"));
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsMoveDirectory)
+TEST_P(MetadataDiskTest, TestValidSingleOperationsMoveDirectory)
 {
     auto metadata = getMetadataStorage("/TestValidSingleOperationsMoveDirectory");
     {
@@ -443,7 +493,7 @@ TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsMoveDirectory)
     EXPECT_FALSE(metadata->existsFileOrDirectory("testdir"));
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsRemoveDirectory)
+TEST_P(MetadataDiskTest, TestValidSingleOperationsRemoveDirectory)
 {
     auto metadata = getMetadataStorage("/TestValidSingleOperationsRemoveDirectory");
     {
@@ -459,7 +509,7 @@ TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsRemoveDirectory)
     EXPECT_FALSE(metadata->existsFileOrDirectory("testdir"));
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsCreateDirectories)
+TEST_P(MetadataDiskTest, TestValidSingleOperationsCreateDirectories)
 {
     auto metadata = getMetadataStorage("/TestValidSingleOperationsCreateDirectories");
     auto transaction = metadata->createTransaction();
@@ -471,7 +521,7 @@ TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsCreateDirectories)
     EXPECT_FALSE(metadata->existsFile("dir1/dir2/dir3"));
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsRemoveRecursive)
+TEST_P(MetadataDiskTest, TestValidSingleOperationsRemoveRecursive)
 {
     auto metadata = getMetadataStorage("/TestValidSingleOperationsRemoveRecursive");
     {
@@ -493,7 +543,7 @@ TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsRemoveRecursive)
     EXPECT_FALSE(metadata->existsFileOrDirectory("dir1"));
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidCreateRemoveInOneTx)
+TEST_P(MetadataDiskTest, TestValidCreateRemoveInOneTx)
 {
     auto metadata = getMetadataStorage("/TestValidCreateRemoveInOneTx");
     {
@@ -515,7 +565,7 @@ TEST_F(MetadataLocalDiskTest, TestValidCreateRemoveInOneTx)
     EXPECT_EQ(metadata->readInlineDataToString("file.txt"), "perm");
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsModifyData)
+TEST_P(MetadataDiskTest, TestValidSingleOperationsModifyData)
 {
     auto metadata = getMetadataStorage("/TestValidSingleOperationsWrite");
 
@@ -537,7 +587,7 @@ TEST_F(MetadataLocalDiskTest, TestValidSingleOperationsModifyData)
     EXPECT_EQ(metadata->readInlineDataToString("f.txt"), "bye");
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidMultipleModifications)
+TEST_P(MetadataDiskTest, TestValidMultipleModifications)
 {
     auto metadata = getMetadataStorage("/TestValidSingleOperationsWrite");
 
@@ -562,7 +612,7 @@ TEST_F(MetadataLocalDiskTest, TestValidMultipleModifications)
     EXPECT_EQ(metadata->getHardlinkCount("f.txt"), 0);
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidModifyDataAndMove)
+TEST_P(MetadataDiskTest, TestValidModifyDataAndMove)
 {
     auto metadata = getMetadataStorage("/TestValidModifyDataAndMove");
 
@@ -589,7 +639,7 @@ TEST_F(MetadataLocalDiskTest, TestValidModifyDataAndMove)
     EXPECT_EQ(metadata->getHardlinkCount("g.txt"), 0);
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidModifyDataAndHardlink)
+TEST_P(MetadataDiskTest, TestValidModifyDataAndHardlink)
 {
     auto metadata = getMetadataStorage("/TestValidModifyDataAndHardlink");
 
@@ -643,7 +693,7 @@ void createDatabaseAndTableDirs(const std::shared_ptr<DB::IMetadataStorage> & me
 }
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsInsertPartSimple)
+TEST_P(MetadataDiskTest, TestValidComplexOperationsInsertPartSimple)
 {
     auto metadata = getMetadataStorage("/TestValidSingleOperationsInsertPartSimple");
     createDatabaseAndTableDirs(metadata, "data/database/table");
@@ -674,7 +724,7 @@ TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsInsertPartSimple)
     EXPECT_EQ(metadata->listDirectory("data/database/table/all_0_0_0/").size(), 9);
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsInsertPartDuplicateDirCreate)
+TEST_P(MetadataDiskTest, TestValidComplexOperationsInsertPartDuplicateDirCreate)
 {
     auto metadata = getMetadataStorage("/TestValidComplexOperationsInsertPartDuplicateDirCreate");
     createDatabaseAndTableDirs(metadata, "data/database/table");
@@ -709,7 +759,7 @@ TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsInsertPartDuplicateDirCr
     EXPECT_EQ(metadata->listDirectory("data/database/table/all_0_0_0/").size(), 10);
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsInsertPartProjections)
+TEST_P(MetadataDiskTest, TestValidComplexOperationsInsertPartProjections)
 {
     auto metadata = getMetadataStorage("/TestValidComplexOperationsInsertPartProjections");
     createDatabaseAndTableDirs(metadata, "data/database/table");
@@ -754,7 +804,7 @@ TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsInsertPartProjections)
     EXPECT_EQ(metadata->listDirectory("data/database/table/all_0_0_0/coolprojection.proj").size(), 3);
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsMutatePart)
+TEST_P(MetadataDiskTest, TestValidComplexOperationsMutatePart)
 {
     auto metadata = getMetadataStorage("/TestValidComplexOperationsMutatePart");
     createDatabaseAndTableDirs(metadata, "data/database/table");
@@ -792,7 +842,7 @@ TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsMutatePart)
     EXPECT_EQ(metadata->readInlineDataToString("data/database/table/all_0_0_0_5/stolbets.mrk2"), "otherdata_source");
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsMutatePartWithProjections)
+TEST_P(MetadataDiskTest, TestValidComplexOperationsMutatePartWithProjections)
 {
     auto metadata = getMetadataStorage("/TestValidComplexOperationsMutatePartWithProjections");
     createDatabaseAndTableDirs(metadata, "data/database/table");
@@ -843,7 +893,7 @@ TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsMutatePartWithProjection
     EXPECT_EQ(metadata->readInlineDataToString("data/database/table/all_0_0_0_5/someprojection.proj/primary.idx"), "aaaaa");
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsMutatePartWithProjectionsWithTmp)
+TEST_P(MetadataDiskTest, TestValidComplexOperationsMutatePartWithProjectionsWithTmp)
 {
     auto metadata = getMetadataStorage("/TestValidComplexOperationsMutatePartWithProjectionsWithTmp");
     createDatabaseAndTableDirs(metadata, "data/database/table");
@@ -899,7 +949,7 @@ TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsMutatePartWithProjection
     EXPECT_EQ(metadata->readInlineDataToString("data/database/table/all_0_0_0_5/someprojection.proj/primary.idx"), "aaaaa");
 }
 
-TEST_F(MetadataLocalDiskTest, ManyMetadataTx)
+TEST_P(MetadataDiskTest, ManyMetadataTx)
 {
     auto metadata = getMetadataStorage("/ManyMetadataTx");
     createDatabaseAndTableDirs(metadata, "data/database/table");
@@ -953,7 +1003,7 @@ TEST_F(MetadataLocalDiskTest, ManyMetadataTx)
     EXPECT_EQ(metadata->getHardlinkCount("data/database/table/all_0_0_0/someprojection.proj/columns.txt"), 1000);
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsRemovePartOrdinary)
+TEST_P(MetadataDiskTest, TestValidComplexOperationsRemovePartOrdinary)
 {
     auto metadata = getMetadataStorage("/TestValidComplexOperationsRemovePartOrdinary");
     createDatabaseAndTableDirs(metadata, "data/database/table");
@@ -982,7 +1032,7 @@ TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsRemovePartOrdinary)
     EXPECT_FALSE(metadata->existsDirectory("data/database/table/all_0_0_0"));
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsRemovePartBadCase)
+TEST_P(MetadataDiskTest, TestValidComplexOperationsRemovePartBadCase)
 {
     auto metadata = getMetadataStorage("/TestValidComplexOperationsRemovePartBadCase");
     createDatabaseAndTableDirs(metadata, "data/database/table");
@@ -1004,7 +1054,7 @@ TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsRemovePartBadCase)
 }
 
 
-TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsMovePartDetached)
+TEST_P(MetadataDiskTest, TestValidComplexOperationsMovePartDetached)
 {
     auto metadata = getMetadataStorage("/TestValidComplexOperationsMovePartDetached");
     createDatabaseAndTableDirs(metadata, "data/database/table");
@@ -1031,7 +1081,7 @@ TEST_F(MetadataLocalDiskTest, TestValidComplexOperationsMovePartDetached)
     EXPECT_EQ(metadata->listDirectory("data/database/table/detached/broken_all_0_0_0").size(), 3);
 }
 
-TEST_F(MetadataLocalDiskTest, TestValidConcurrentHardlinks)
+TEST_P(MetadataDiskTest, TestValidConcurrentHardlinks)
 {
     auto metadata = getMetadataStorage("/TestValidConcurrentHardlinks");
     createDatabaseAndTableDirs(metadata, "data/database/table");
@@ -1130,7 +1180,7 @@ TEST_F(MetadataLocalDiskTest, TestValidConcurrentHardlinks)
     EXPECT_EQ(metadata->getHardlinkCount("data/database/table/all_0_0_0_1/someprojection.proj/columns.txt"), 0);
 }
 
-TEST_F(MetadataLocalDiskTest, TestUnlinkRollbackHardlinks)
+TEST_P(MetadataDiskTest, TestUnlinkRollbackHardlinks)
 {
     auto metadata = getMetadataStorage("/TestUnlinkRollbackHardlinks");
 
@@ -1158,7 +1208,7 @@ TEST_F(MetadataLocalDiskTest, TestUnlinkRollbackHardlinks)
     EXPECT_EQ(metadata->getHardlinkCount("file-link-2"), 2);
 }
 
-TEST_F(MetadataLocalDiskTest, TestFoldedRemoveRecursiveRollback)
+TEST_P(MetadataDiskTest, TestFoldedRemoveRecursiveRollback)
 {
     auto metadata = getMetadataStorage("/TestUnlinkRollbackHardlinks");
 
@@ -1206,7 +1256,7 @@ TEST_F(MetadataLocalDiskTest, TestFoldedRemoveRecursiveRollback)
     }
 }
 
-TEST_F(MetadataLocalDiskTest, TestTruncate)
+TEST_P(MetadataDiskTest, TestTruncate)
 {
     auto metadata = getMetadataStorage("/TestTruncate");
 
@@ -1235,8 +1285,11 @@ TEST_F(MetadataLocalDiskTest, TestTruncate)
     EXPECT_EQ(metadata->getStorageObjects("file").front().remote_path, "blob-1");
 }
 
-TEST_F(MetadataLocalDiskTest, TestRecursiveCyclicRemove)
+TEST_P(MetadataDiskTest, TestRecursiveCyclicRemove)
 {
+    if (GetParam() != "local")
+        GTEST_SKIP() << "Symlinks exist only on the local disk";
+
     auto metadata = getMetadataStorage("/TestRecursiveCyclicRemove");
     auto disk = getMetadataDisk("/TestRecursiveCyclicRemove");
 
@@ -1251,7 +1304,7 @@ TEST_F(MetadataLocalDiskTest, TestRecursiveCyclicRemove)
     }
 }
 
-TEST_F(MetadataLocalDiskTest, TestRecursiveRemoveHardlinks)
+TEST_P(MetadataDiskTest, TestRecursiveRemoveHardlinks)
 {
     auto metadata = getMetadataStorage("/TestRecursiveRemoveHardlinks");
 
@@ -1278,7 +1331,7 @@ TEST_F(MetadataLocalDiskTest, TestRecursiveRemoveHardlinks)
     EXPECT_FALSE(metadata->existsFile("root/B"));
 }
 
-TEST_F(MetadataLocalDiskTest, TestComplexUnlink)
+TEST_P(MetadataDiskTest, TestComplexUnlink)
 {
     auto metadata = getMetadataStorage("/TestComplexUnlink");
 
@@ -1300,7 +1353,7 @@ TEST_F(MetadataLocalDiskTest, TestComplexUnlink)
     EXPECT_FALSE(metadata->existsFile("file"));
 }
 
-TEST_F(MetadataLocalDiskTest, TestComplexRemoveRecursive)
+TEST_P(MetadataDiskTest, TestComplexRemoveRecursive)
 {
     auto metadata = getMetadataStorage("/TestComplexRemoveRecursive");
 
@@ -1333,7 +1386,7 @@ TEST_F(MetadataLocalDiskTest, TestComplexRemoveRecursive)
     EXPECT_FALSE(metadata->existsFileOrDirectory("A"));
 }
 
-TEST_F(MetadataLocalDiskTest, TestNonExistingObjects)
+TEST_P(MetadataDiskTest, TestNonExistingObjects)
 {
     auto metadata = getMetadataStorage("/TestNonExistingObjects");
     EXPECT_FALSE(metadata->existsFile("non-existing"));
@@ -1347,7 +1400,7 @@ TEST_F(MetadataLocalDiskTest, TestNonExistingObjects)
     EXPECT_THROW(metadata->getHardlinkCount("non-existing"), std::exception);
 }
 
-TEST_F(MetadataLocalDiskTest, TestNonExistingObjectsInTransaction)
+TEST_P(MetadataDiskTest, TestNonExistingObjectsInTransaction)
 {
     auto metadata = getMetadataStorage("/TestNonExistingObjectsInTransaction");
 
