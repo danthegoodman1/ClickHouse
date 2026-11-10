@@ -451,12 +451,14 @@ std::vector<std::string> InodeDBTableCoordinator::claim(const std::vector<std::s
             continue;
         }
         auto current = ClaimValue::fromText(claims[i]->value);
-        if (current.done || current.expiry_ms > now)
+        /// A control plane may hold parts for this writer by naming it in their claims.
+        const bool for_this_writer = current.writer == writerId();
+        if (current.done || (current.expiry_ms > now && !for_this_writer))
         {
             held_elsewhere.push_back(sources[i]);
             continue;
         }
-        ++taken_over;
+        taken_over += !for_this_writer;
         options.ops.push_back(atVersion(putOp(paths[i], value, InodeDBCommitOptions::Mode::Replace, InodeDBCommitStatus::ClaimLost),
             claims[i]->version, InodeDBCommitStatus::ClaimLost));
     }
