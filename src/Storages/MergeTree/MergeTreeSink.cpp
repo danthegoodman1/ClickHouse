@@ -38,6 +38,9 @@ namespace FailPoints
 {
     extern const char inodedb_insert_pause_before_commit[];
     extern const char inodedb_insert_pause_after_commit[];
+    extern const char inodedb_shared_reserve_block_number[];
+    extern const char inodedb_tokens_after_part[];
+    extern const char inodedb_insert_pause_before_tokens[];
 }
 
 namespace ErrorCodes
@@ -541,20 +544,43 @@ std::vector<std::string> MergeTreeSink::commitPartOnInodeDB(MergeTreeMutableData
         return {};
     }
 
+    /// The hazard test of a reserved block number takes the number in a batch of its own, before the part's.
+    std::optional<Int64> reserved;
+    fiu_do_on(FailPoints::inodedb_shared_reserve_block_number,
+    {
+        while (shared && !reserved)
+        {
+            InodeDBCommitOptions reservation;
+            const Int64 next = coordinator.nextBlockNumber();
+            coordinator.addCounterUpdate(reservation, next);
+            if (auto result = coordinator.coordination().commit(reservation); result.status == InodeDBCommitStatus::Committed)
+            {
+                coordinator.counterCommitted(next, result.version);
+                reserved = next;
+            }
+            else
+                coordinator.readCounter();
+        }
+    });
+
+    /// The hazard test of lost tokens commits them in a batch after the part's, as a deduplication log would.
+    bool tokens_after_part = false;
+    fiu_do_on(FailPoints::inodedb_tokens_after_part, { tokens_after_part = true; });
+
     while (true)
     {
         Int64 number = 0;
         if (shared)
         {
             /// The number exists only in this batch: no other writer's merge can cover it before the part commits.
-            number = coordinator.nextBlockNumber();
+            number = reserved ? *reserved : coordinator.nextBlockNumber();
             part->info.min_block = number;
             part->info.max_block = number;
             part->setName(part->getNewName(part->info));
 
             /// Another writer's part took the number since this writer read the counter.
             const auto target = std::filesystem::path(storage.getRelativeDataPath()) / part->name;
-            if (storage.getStoragePolicy()->getDisks().front()->existsDirectory(target))
+            if (!reserved && storage.getStoragePolicy()->getDisks().front()->existsDirectory(target))
             {
                 ProfileEvents::increment(ProfileEvents::InodeDBCommitRetries);
                 if (coordinator.readCounter() < number)
@@ -567,10 +593,12 @@ std::vector<std::string> MergeTreeSink::commitPartOnInodeDB(MergeTreeMutableData
         /// conflict, the next batch moves it to the next number instead.
         InodeDBCommitOptions options;
         coordinator.addPartRename(options, part_storage.getPartDirectory(), part->name);
-        coordinator.addTokens(options, block_ids, part->name);
+        if (!tokens_after_part)
+            coordinator.addTokens(options, block_ids, part->name);
         if (shared)
         {
-            coordinator.addCounterUpdate(options, number);
+            if (!reserved)
+                coordinator.addCounterUpdate(options, number);
             coordinator.addDefinitionCheck(options);
         }
 
@@ -580,8 +608,15 @@ std::vector<std::string> MergeTreeSink::commitPartOnInodeDB(MergeTreeMutableData
         {
             case InodeDBCommitStatus::Committed:
             {
-                if (shared)
+                if (shared && !reserved)
                     coordinator.counterCommitted(number, outcome.version);
+                if (tokens_after_part && !block_ids.empty())
+                {
+                    FailPointInjection::pauseFailPoint(FailPoints::inodedb_insert_pause_before_tokens);
+                    InodeDBCommitOptions token_options;
+                    coordinator.addTokens(token_options, block_ids, part->name);
+                    coordinator.coordination().commit(token_options);
+                }
                 coordinator.tokensCommitted(block_ids, part->name);
                 /// The directory moved in the batch; the part's storage follows it.
                 const String old_root = part_storage.getRelativePath();

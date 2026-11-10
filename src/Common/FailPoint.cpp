@@ -32,11 +32,17 @@ static struct InitFiu
 /// - PAUSEABLE: the failpoint will be blocked every time when pauseFailPoint is called, until disableFailPoint is called.
 
 #define APPLY_FOR_FAILPOINTS(ONCE, REGULAR, PAUSEABLE_ONCE, PAUSEABLE) \
-    /* BigHouse: points where tests stop a writer of an `inodedb` disk, and switches that remove a shared writer's */ \
-    /* protections, so each hazard's test can show it fails without one. */ \
+    /* BigHouse: points where tests stop a writer of an `inodedb` disk or hold its view stale, and switches that */ \
+    /* remove a shared writer's protections, so each hazard's test can show it fails without one. */ \
     PAUSEABLE_ONCE(inodedb_insert_pause_before_commit) \
     PAUSEABLE_ONCE(inodedb_insert_pause_after_commit) \
     PAUSEABLE_ONCE(inodedb_merge_pause_before_commit) \
+    REGULAR(inodedb_list_in_pages) \
+    PAUSEABLE_ONCE(inodedb_list_pause_between_pages) \
+    REGULAR(inodedb_shared_skip_refresh) \
+    REGULAR(inodedb_shared_reserve_block_number) \
+    REGULAR(inodedb_tokens_after_part) \
+    PAUSEABLE_ONCE(inodedb_insert_pause_before_tokens) \
     REGULAR(inodedb_shared_merge_past_refresh) \
     REGULAR(inodedb_shared_release_claims_at_commit) \
     REGULAR(inodedb_shared_startup_cleanup) \

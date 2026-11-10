@@ -413,6 +413,7 @@ namespace FailPoints
 {
     extern const char merge_tree_drop_all_data_pause_before_removing_parts[];
     extern const char claim_inject_stale_part_dir[];
+    extern const char inodedb_shared_skip_refresh[];
     /// Pauses the asynchronous loading of outdated parts right before the next part is taken, so a
     /// test can make the table read-only while the loading is pending and check that it stops.
     extern const char mt_pause_before_loading_outdated_part[];
@@ -3544,6 +3545,12 @@ void MergeTreeData::refreshDataPartsOnce(UInt64 interval_milliseconds)
     {
         throw Exception(ErrorCodes::FAULT_INJECTED, "Injected transient failure into MergeTreeData::refreshDataPartsOnce");
     });
+
+    /// BigHouse: hazard tests hold a shared writer's view of the parts stale.
+    bool skip_refresh = false;
+    fiu_do_on(FailPoints::inodedb_shared_skip_refresh, { skip_refresh = isSharedWriter(); });
+    if (skip_refresh)
+        return;
 
     for (auto & disk : getStoragePolicy()->getDisks())
         disk->refresh(interval_milliseconds);

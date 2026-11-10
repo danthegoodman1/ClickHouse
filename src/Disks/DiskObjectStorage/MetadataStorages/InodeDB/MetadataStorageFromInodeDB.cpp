@@ -9,6 +9,7 @@
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/ThreadPool.h>
 #include <Common/ProfileEvents.h>
 #include <Common/getRandomASCIIString.h>
@@ -36,6 +37,12 @@ namespace ProfileEvents
 
 namespace DB
 {
+
+namespace FailPoints
+{
+    extern const char inodedb_list_in_pages[];
+    extern const char inodedb_list_pause_between_pages[];
+}
 
 namespace ErrorCodes
 {
@@ -1346,6 +1353,11 @@ InodeDB::MetadataCache::Presence MetadataStorageFromInodeDB::presenceOf(const st
 InodeDB::Listing MetadataStorageFromInodeDB::listingOf(const std::string & path) const
 {
     const std::string inodedb_path = treePath(path);
+    bool in_pages = false;
+    fiu_do_on(FailPoints::inodedb_list_in_pages, { in_pages = true; });
+    if (in_pages)
+        return listingInPages(inodedb_path);
+
     if (auto cached = cache->listing(inodedb_path))
         return std::move(*cached);
 
@@ -1356,6 +1368,33 @@ InodeDB::Listing MetadataStorageFromInodeDB::listingOf(const std::string & path)
     auto listing = client->list(std::move(request));
     cache->putListing(inodedb_path, listing, listing.version);
     return listing;
+}
+
+InodeDB::Listing MetadataStorageFromInodeDB::listingInPages(const std::string & inodedb_path) const
+{
+    constexpr UInt64 page_size = 1024;
+    InodeDB::Listing listing;
+    while (true)
+    {
+        pb::ListRequest request;
+        request.set_path(inodedb_path);
+        request.set_attrs(true);
+        request.set_values(true);
+        request.set_limit(page_size);
+        if (!listing.entries.empty())
+            request.set_after(listing.entries.back().name());
+        auto page = client->list(std::move(request));
+        if (page.error)
+            return page;
+        if (listing.version == 0 || page.version < listing.version)
+            listing.version = page.version;
+        const bool full = page.entries.size() == page_size;
+        std::ranges::move(page.entries, std::back_inserter(listing.entries));
+        if (!full)
+            return listing;
+        if (listing.entries.size() == page_size)
+            FailPointInjection::pauseFailPoint(FailPoints::inodedb_list_pause_between_pages);
+    }
 }
 
 bool MetadataStorageFromInodeDB::existsFile(const std::string & path) const

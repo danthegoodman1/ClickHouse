@@ -168,6 +168,9 @@ private:
     InodeDB::MetadataCache::Presence presenceOf(const std::string & path) const;
     /// The listing of a disk directory, from the cache when it holds it.
     InodeDB::Listing listingOf(const std::string & path) const;
+    /// The listing of an InodeDB directory read one page per request, each page at its own version, past
+    /// the cache. Hazard tests list this way (`inodedb_list_in_pages`) to pause between the first two pages.
+    InodeDB::Listing listingInPages(const std::string & inodedb_path) const;
 
     /// The record a value holds, following a spill pointer. Throws `UNKNOWN_FORMAT` for other kinds.
     DiskObjectStorageMetadata recordOf(const InodeDB::Value & value, const std::string & path) const;
