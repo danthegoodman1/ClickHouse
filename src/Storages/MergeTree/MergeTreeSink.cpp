@@ -13,6 +13,7 @@
 #include <Common/FailPoint.h>
 #include <Common/thread_local_rng.h>
 #include <Core/Settings.h>
+#include <base/scope_guard.h>
 #include <base/sleep.h>
 
 #include <exception>
@@ -310,7 +311,13 @@ void MergeTreeSink::finishDelayedChunk()
         while (true)
         {
             partition.temp_part->finalize();
-            partition.temp_part->part->getDataPartStorage().commitTransaction();
+            /// BigHouse: a storage that commits a new part's files with its rename keeps the transaction open, and
+            /// `commitPart` commits both at once. A part that leaves without being added, because it was
+            /// deduplicated, covered or failed, undoes its transaction, which removes the blobs it uploaded.
+            auto part_storage = partition.temp_part->part->getDataPartStoragePtr();
+            if (!part_storage->commitsNewPartWithRename())
+                part_storage->commitTransaction();
+            SCOPE_EXIT(part_storage->undoTransaction());
 
             auto & part = partition.temp_part->part;
             auto deduplication_hashes = partition.deduplication_info->getDeduplicationHashes(part->info.getPartitionId(), deduplicate);

@@ -46,6 +46,8 @@ public:
     void beginTransaction() override;
     void commitTransaction() override;
     void precommitTransaction() override {}
+    /// BigHouse: on a disk with `inodedb` metadata.
+    bool commitsNewPartWithRename() const override;
     bool hasActiveTransaction() const override { return transaction != nullptr; }
     void undoTransaction() override;
 #if CLICKHOUSE_CLOUD

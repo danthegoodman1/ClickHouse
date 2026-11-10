@@ -246,6 +246,12 @@ void DataPartStorageOnDiskFull::beginTransaction()
     transaction = volume->getDisk()->createTransaction();
 }
 
+bool DataPartStorageOnDiskFull::commitsNewPartWithRename() const
+{
+    /// BigHouse: each transaction on an `inodedb` disk is one InodeDB commit, which waits for the store's sync.
+    return volume->getDisk()->getDataSourceDescription().metadata_type == MetadataStorageType::InodeDB;
+}
+
 void DataPartStorageOnDiskFull::commitTransaction()
 {
     if (!transaction)

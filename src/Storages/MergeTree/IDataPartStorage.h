@@ -201,6 +201,9 @@ public:
     virtual bool isStoredOnRemoteDisk() const { return false; }
     virtual std::optional<String> getCacheName() const { return std::nullopt; }
     virtual bool supportZeroCopyReplication() const { return false; }
+    /// BigHouse: whether an inserted part's files commit together with its rename, in one transaction. A disk whose
+    /// every transaction is a durable remote commit, such as one with `inodedb` metadata, then makes one, not two.
+    virtual bool commitsNewPartWithRename() const { return false; }
     virtual bool supportParallelWrite() const = 0;
     virtual bool isBroken() const = 0;
     virtual bool isReadonly() const = 0;
