@@ -1,5 +1,6 @@
 #include <Storages/MergeTree/MergeTreeSink.h>
 #include <Storages/StorageMergeTree.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/InodeDB/InodeDBTableCoordinator.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Interpreters/InsertDeduplication.h>
@@ -17,11 +18,13 @@
 #include <base/sleep.h>
 
 #include <exception>
+#include <filesystem>
 #include <memory>
 
 namespace ProfileEvents
 {
     extern const Event DuplicatedInsertedBlocks;
+    extern const Event InodeDBCommitRetries;
     extern const Event SelfDuplicatedAsyncInserts;
     extern const Event DuplicatedAsyncInserts;
     extern const Event DuplicationElapsedMicroseconds;
@@ -31,9 +34,18 @@ namespace ProfileEvents
 namespace DB
 {
 
+namespace FailPoints
+{
+    extern const char inodedb_insert_pause_before_commit[];
+    extern const char inodedb_insert_pause_after_commit[];
+}
+
 namespace ErrorCodes
 {
+    extern const int ABORTED;
     extern const int INSERT_WAS_DEDUPLICATED;
+    extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace Setting
@@ -79,7 +91,8 @@ MergeTreeSink::MergeTreeSink(
     , max_parts_per_block(max_parts_per_block_)
     , context(context_)
     , storage_snapshot(storage.getStorageSnapshotWithoutData(metadata_snapshot, context_))
-    , deduplicate((*storage.getSettings())[MergeTreeSetting::non_replicated_deduplication_window] > 0 && storage.getDeduplicationLog() != nullptr)
+    , deduplicate((*storage.getSettings())[MergeTreeSetting::non_replicated_deduplication_window] > 0
+        && (storage.getDeduplicationLog() != nullptr || storage.getInodeDBCoordinator() != nullptr))
 {
     LOG_TEST(storage.log, "Create MergeTreeSink, deduplicate={}", deduplicate);
 
@@ -325,6 +338,10 @@ void MergeTreeSink::finishDelayedChunk()
 
             if (conflicts.empty())
             {
+                /// BigHouse: tests stop a writer here, between a table's commit and its views' commits.
+                if (storage.getInodeDBCoordinator())
+                    FailPointInjection::pauseFailPoint(FailPoints::inodedb_insert_pause_after_commit);
+
                 partition.temp_part->prewarmCaches();
 
                 profile_events_scope.reset();
@@ -418,6 +435,15 @@ MergeTreeTemporaryPartPtr MergeTreeSink::writeNewTempPart(BlockWithPartition & b
 
 std::vector<std::string> MergeTreeSink::commitPart(MergeTreeMutableDataPartPtr & part, const std::vector<DeduplicationHash> & deduplication_hashes)
 {
+    /// BigHouse: on a writable `inodedb` disk, tokens and block numbers commit in the part's batch.
+    if (storage.getInodeDBCoordinator())
+    {
+        std::vector<std::string> block_ids;
+        if (!deduplication_hashes.empty())
+            block_ids = getDeduplicationBlockIds(deduplication_hashes);
+        return commitPartOnInodeDB(part, block_ids);
+    }
+
     /// It's important to create it outside of lock scope because
     /// otherwise it can lock parts in destructor and deadlock is possible.
     MergeTreeData::Transaction transaction(storage, context->getCurrentTransaction().get());
@@ -468,6 +494,127 @@ std::vector<std::string> MergeTreeSink::commitPart(MergeTreeMutableDataPartPtr &
     }
 
     return {};
+}
+
+std::vector<std::string> MergeTreeSink::commitPartOnInodeDB(MergeTreeMutableDataPartPtr & part, const std::vector<std::string> & block_ids)
+{
+    auto & coordinator = *storage.getInodeDBCoordinator();
+    auto & part_storage = part->getDataPartStorage();
+    const bool shared = coordinator.shared();
+    /// A full part keeps the transaction that holds its files open until its rename (`commitsNewPartWithRename`).
+    const bool in_batch = part_storage.hasActiveTransaction() && part_storage.commitsNewPartWithRename();
+    if (shared && !in_batch)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "A writer that shares its disk commits parts with full storage, and part {} is packed: set `min_bytes_for_full_part_storage` to 0",
+            part->name);
+
+    /// It's important to create it outside of lock scope because
+    /// otherwise it can lock parts in destructor and deadlock is possible.
+    MergeTreeData::Transaction transaction(storage, context->getCurrentTransaction().get());
+    auto lock = storage.lockParts();
+
+    /// An exclusive writer knows every token in its window; a shared writer learns others' from its commits.
+    if (auto known = coordinator.knownTokens(block_ids); !known.empty())
+    {
+        for (const auto & block_id : known)
+            LOG_INFO(storage.log, "Block with ID {} already exists; ignoring it", block_id);
+        return known;
+    }
+    storage.throwIfTemporaryTableSizeLimitsExceededForReplacement(context, lock, {part}, std::nullopt);
+
+    std::unique_ptr<PlainCommittingBlockHolder> block_holder;
+    if (!shared)
+        block_holder = storage.fillNewPartName(part, lock);
+
+    if (!in_batch)
+    {
+        /// A packed part's files committed before its rename, so its tokens follow in a batch of their own.
+        storage.renameTempPartAndAdd(part, transaction, lock, /*rename_in_transaction=*/ false);
+        transaction.commit(lock);
+        if (!block_ids.empty())
+        {
+            InodeDBCommitOptions options;
+            coordinator.addTokens(options, block_ids, part->name);
+            if (coordinator.coordination().commit(options).status == InodeDBCommitStatus::Committed)
+                coordinator.tokensCommitted(block_ids, part->name);
+        }
+        return {};
+    }
+
+    while (true)
+    {
+        Int64 number = 0;
+        if (shared)
+        {
+            /// The number exists only in this batch: no other writer's merge can cover it before the part commits.
+            number = coordinator.nextBlockNumber();
+            part->info.min_block = number;
+            part->info.max_block = number;
+            part->setName(part->getNewName(part->info));
+
+            /// Another writer's part took the number since this writer read the counter.
+            const auto target = std::filesystem::path(storage.getRelativeDataPath()) / part->name;
+            if (storage.getStoragePolicy()->getDisks().front()->existsDirectory(target))
+            {
+                ProfileEvents::increment(ProfileEvents::InodeDBCommitRetries);
+                if (coordinator.readCounter() < number)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Part {} exists, but the block number counter of {} is below it",
+                        part->name, storage.getStorageID().getNameForLogs());
+                continue;
+            }
+        }
+        /// The batch writes the part's files under its temporary directory and moves it to the part's name. After a
+        /// conflict, the next batch moves it to the next number instead.
+        InodeDBCommitOptions options;
+        coordinator.addPartRename(options, part_storage.getPartDirectory(), part->name);
+        coordinator.addTokens(options, block_ids, part->name);
+        if (shared)
+        {
+            coordinator.addCounterUpdate(options, number);
+            coordinator.addDefinitionCheck(options);
+        }
+
+        FailPointInjection::pauseFailPoint(FailPoints::inodedb_insert_pause_before_commit);
+        auto outcome = part_storage.commitTransactionWith(options);
+        switch (outcome.status)
+        {
+            case InodeDBCommitStatus::Committed:
+            {
+                if (shared)
+                    coordinator.counterCommitted(number, outcome.version);
+                coordinator.tokensCommitted(block_ids, part->name);
+                /// The directory moved in the batch; the part's storage follows it.
+                const String old_root = part_storage.getRelativePath();
+                part_storage.setRelativePath(part->name);
+                const String new_root = part_storage.getRelativePath();
+                for (const auto & [_, projection] : part->getProjectionParts())
+                    projection->getDataPartStorage().changeRootPath(old_root, new_root);
+                /// The part's directory has its name already, so this adds the part to the table and renames nothing.
+                storage.renameTempPartAndAdd(part, transaction, lock, /*rename_in_transaction=*/ false);
+                transaction.commit(lock);
+                return {};
+            }
+            case InodeDBCommitStatus::CounterConflict:
+            {
+                ProfileEvents::increment(ProfileEvents::InodeDBCommitRetries);
+                coordinator.readCounter();
+                continue;
+            }
+            case InodeDBCommitStatus::DuplicateToken:
+            {
+                auto duplicates = coordinator.duplicatesOf(outcome);
+                for (const auto & block_id : duplicates)
+                    LOG_INFO(storage.log, "Block with ID {} already exists; ignoring it", block_id);
+                return duplicates;
+            }
+            case InodeDBCommitStatus::SchemaChanged:
+                throw Exception(ErrorCodes::ABORTED,
+                    "The definition of {} changed since this writer loaded it, so the insert committed nothing; retry it on a writer "
+                    "that loaded the new definition", storage.getStorageID().getNameForLogs());
+            case InodeDBCommitStatus::ClaimLost:
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "An insert's commit into {} failed on a merge claim", storage.getStorageID().getNameForLogs());
+        }
+    }
 }
 
 }

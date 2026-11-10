@@ -10,8 +10,10 @@
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/ThreadPool.h>
+#include <Common/ProfileEvents.h>
 #include <Common/getRandomASCIIString.h>
 #include <Common/logger_useful.h>
+#include <Common/thread_local_rng.h>
 
 #include <magic_enum.hpp>
 
@@ -27,6 +29,11 @@
 
 namespace fs = std::filesystem;
 
+namespace ProfileEvents
+{
+    extern const Event InodeDBCommitConflicts;
+}
+
 namespace DB
 {
 
@@ -41,6 +48,7 @@ namespace ErrorCodes
     extern const int FILE_DOESNT_EXIST;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
+    extern const int SUPPORT_IS_DISABLED;
     extern const int TABLE_IS_READ_ONLY;
     extern const int UNKNOWN_FORMAT;
 }
@@ -54,6 +62,10 @@ namespace
 
 constexpr std::string_view OWNER_PATH = "owner";
 constexpr std::string_view TRASH_PATH = "trash";
+constexpr std::string_view COORD_PATH = "coord";
+/// `owner` holds the mode of the writers it fences in, then the id of the writer that wrote it.
+constexpr std::string_view EXCLUSIVE_OWNER_PREFIX = "exclusive ";
+constexpr std::string_view SHARED_OWNER_PREFIX = "shared ";
 
 /// A disk path relative to the disk's root, without leading or trailing slashes. Dot-files keep their dots.
 std::string normalize(const std::string & path)
@@ -97,6 +109,14 @@ std::string parentOf(const std::string & path)
 std::string randomName()
 {
     return getRandomASCIIString(32);
+}
+
+/// Whether a disk path holds database or table definitions, which only an exclusive writer changes.
+bool holdsDefinitions(const std::string & path)
+{
+    const std::string normal = normalize(path);
+    return normal.ends_with(".sql") || normal.ends_with(".sql.tmp") || normal.ends_with(".sql.detached")
+        || isUnder(normal, "metadata") || isUnder(normal, "metadata_dropped");
 }
 
 bool holdsRecord(const Value & value)
@@ -339,7 +359,7 @@ void InodeDBBatchBuilder::load(FileNode & node)
         return;
     chassert(read_state && node.store_path);
 
-    if (auto file = storage.readFile(*node.store_path))
+    if (auto file = storage.readTreeFile(*node.store_path))
     {
         node.value = std::move(file->value);
         node.stored_links = file->inode.nlink();
@@ -455,7 +475,7 @@ void InodeDBBatchBuilder::retainKept(
     };
     std::map<UInt64, Inode> inodes;
 
-    if (auto file = storage.readFile(path))
+    if (auto file = storage.readTreeFile(path))
     {
         auto & inode = inodes[file->inode.handle().ino()];
         inode.links = file->inode.nlink();
@@ -567,6 +587,8 @@ void InodeDBBatchBuilder::apply(const Intent & intent, size_t intent_index)
         case IntentKind::RemoveDirectory:
         {
             emit(rmdirOp(tree_path), intent_index);
+            /// A directory's coordination files go with it, as a table's do when it is dropped.
+            emit(removeAllOp(IInodeDBCoordination::coordPath(path)), std::nullopt);
             break;
         }
         case IntentKind::RemoveRecursive:
@@ -574,6 +596,7 @@ void InodeDBBatchBuilder::apply(const Intent & intent, size_t intent_index)
             if (intent.predicate)
                 retainKept(path, intent.predicate, intent_index);
             emit(removeAllOp(tree_path), intent_index);
+            emit(removeAllOp(IInodeDBCoordination::coordPath(path)), std::nullopt);
             removeSubtree(path);
             frees = true;
             break;
@@ -937,16 +960,11 @@ MetadataStorageFromInodeDB::MetadataStorageFromInodeDB(
     , description("inodedb://" + client->endpoint())
     , log(getLogger("MetadataStorageFromInodeDB"))
     , cache(std::make_unique<InodeDB::MetadataCache>(settings.cache_bytes))
+    , writer_id(fmt::format("{:08x}", static_cast<UInt32>(thread_local_rng())))
 {
 }
 
 MetadataStorageFromInodeDB::~MetadataStorageFromInodeDB() = default;
-
-std::string MetadataStorageFromInodeDB::treePath(const std::string & path)
-{
-    std::string normal = normalize(path);
-    return normal.empty() ? "tree" : "tree/" + normal;
-}
 
 MetadataTransactionPtr MetadataStorageFromInodeDB::createTransaction()
 {
@@ -964,11 +982,19 @@ void MetadataStorageFromInodeDB::startup()
         return;
     }
 
-    /// Bumping `owner` fences off any earlier writer: its batches require the version it wrote.
+    if (settings.shared)
+    {
+        joinSharedOwner();
+        reader_lease = std::make_unique<InodeDBReaderLease>(client, settings.lease_lag, log);
+        return;
+    }
+
+    /// Writing `owner` fences off every other writer: their batches require the version they found or wrote.
     pb::CommitRequest request;
     *request.add_ops() = mkdirOp("tree", /*parents=*/ false);
     *request.add_ops() = mkdirOp(std::string(TRASH_PATH), /*parents=*/ false);
-    *request.add_ops() = putOp(std::string(OWNER_PATH), getRandomASCIIString(16), pb::UPSERT);
+    *request.add_ops() = mkdirOp(std::string(COORD_PATH), /*parents=*/ false);
+    *request.add_ops() = putOp(std::string(OWNER_PATH), fmt::format("{}{}", EXCLUSIVE_OWNER_PREFIX, writer_id), pb::UPSERT);
     request.set_all_or_nothing(true);
 
     auto response = client->commit(request);
@@ -979,7 +1005,148 @@ void MetadataStorageFromInodeDB::startup()
 
     /// The commit's version is the owner file's version: reading it back could see a later writer's.
     owner_version = response.version();
-    LOG_INFO(log, "Took ownership of {} at version {}", description, response.version());
+    LOG_INFO(log, "Took ownership of {} at version {} as writer {}", description, response.version(), writer_id);
+}
+
+void MetadataStorageFromInodeDB::joinSharedOwner()
+{
+    while (true)
+    {
+        auto owner = readFile(std::string(OWNER_PATH));
+        if (owner && owner->value.starts_with(SHARED_OWNER_PREFIX))
+        {
+            /// The writer that wrote a shared owner created the tree in the same batch.
+            owner_version = owner->version;
+            LOG_INFO(log, "Joined the shared writers of {} at owner version {} as writer {}", description, owner->version, writer_id);
+            return;
+        }
+
+        /// Replacing an exclusive owner, or none, under the version read fences the exclusive writer, and of
+        /// shared writers starting at once only the first replaces it; the others join on their next read.
+        pb::CommitRequest request;
+        *request.add_ops() = mkdirOp("tree", /*parents=*/ false);
+        *request.add_ops() = mkdirOp(std::string(TRASH_PATH), /*parents=*/ false);
+        *request.add_ops() = mkdirOp(std::string(COORD_PATH), /*parents=*/ false);
+        *request.add_ops() = putOp(std::string(OWNER_PATH), fmt::format("{}{}", SHARED_OWNER_PREFIX, writer_id), pb::UPSERT);
+        auto * when = request.add_when();
+        if (owner)
+        {
+            when->mutable_version_is()->set_path(std::string(OWNER_PATH));
+            when->mutable_version_is()->set_version(owner->version);
+        }
+        else
+        {
+            when->set_absent(std::string(OWNER_PATH));
+        }
+        request.set_all_or_nothing(true);
+
+        auto response = client->commit(request);
+        bool owner_changed = false;
+        for (const auto & outcome : response.outcomes())
+        {
+            if (!outcome.has_skipped() || outcome.skipped().reason_case() == pb::Skipped::kAborted)
+                continue;
+            if (outcome.skipped().reason_case() != pb::Skipped::kWhen)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "{} could not begin a shared epoch: {}", description, outcome.skipped().ShortDebugString());
+            owner_changed = true;
+        }
+        if (owner_changed)
+            continue;
+
+        cache->invalidate(request, response);
+        owner_version = response.version();
+        LOG_INFO(log, "Began a shared epoch of {} at version {} as writer {}", description, response.version(), writer_id);
+        return;
+    }
+}
+
+std::optional<IInodeDBCoordination::File> MetadataStorageFromInodeDB::readFile(const std::string & path) const
+{
+    pb::ReadRequest request;
+    request.add_targets()->mutable_target()->set_path(path);
+    auto response = client->read(request);
+    if (response.results_size() != 1)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "InodeDB answered a read of one file with {} results", response.results_size());
+
+    const auto & result = response.results(0);
+    if (result.has_error())
+    {
+        switch (result.error())
+        {
+            case pb::NOT_FOUND:
+            case pb::NOT_DIR:
+                return std::nullopt;
+            default:
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Reading `{}` from InodeDB failed with {}", path, pb::Error_Name(result.error()));
+        }
+    }
+    return IInodeDBCoordination::File{result.value().value(), result.value().inode().version(), result.value().inode().mtime()};
+}
+
+std::vector<std::optional<IInodeDBCoordination::File>> MetadataStorageFromInodeDB::readFiles(const std::vector<std::string> & paths) const
+{
+    /// InodeDB reads at most 60 targets a call.
+    constexpr size_t max_targets = 60;
+    std::vector<std::optional<IInodeDBCoordination::File>> files;
+    files.reserve(paths.size());
+    for (size_t begin = 0; begin < paths.size(); begin += max_targets)
+    {
+        const size_t end = std::min(paths.size(), begin + max_targets);
+        pb::ReadRequest request;
+        for (size_t i = begin; i < end; ++i)
+            request.add_targets()->mutable_target()->set_path(paths[i]);
+        auto response = client->read(request);
+        if (static_cast<size_t>(response.results_size()) != end - begin)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "InodeDB answered a read of {} files with {} results", end - begin, response.results_size());
+        for (size_t i = begin; i < end; ++i)
+        {
+            const auto & result = response.results(static_cast<int>(i - begin));
+            if (!result.has_error())
+            {
+                files.emplace_back(IInodeDBCoordination::File{result.value().value(), result.value().inode().version(), result.value().inode().mtime()});
+                continue;
+            }
+            if (result.error() != pb::NOT_FOUND && result.error() != pb::NOT_DIR)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Reading `{}` from InodeDB failed with {}", paths[i], pb::Error_Name(result.error()));
+            files.emplace_back(std::nullopt);
+        }
+    }
+    return files;
+}
+
+std::vector<std::pair<std::string, IInodeDBCoordination::File>> MetadataStorageFromInodeDB::listFiles(const std::string & dir) const
+{
+    pb::ListRequest request;
+    request.set_path(dir);
+    request.set_attrs(true);
+    request.set_values(true);
+    auto listing = client->list(std::move(request));
+    if (listing.error)
+    {
+        if (*listing.error == pb::NOT_FOUND)
+            return {};
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Listing `{}` in InodeDB failed with {}", dir, pb::Error_Name(*listing.error));
+    }
+
+    std::vector<std::pair<std::string, IInodeDBCoordination::File>> files;
+    files.reserve(listing.entries.size());
+    for (auto & entry : listing.entries)
+        if (entry.kind() == pb::FILE)
+            files.emplace_back(entry.name(), IInodeDBCoordination::File{std::move(*entry.mutable_value()), entry.inode().version(), entry.inode().mtime()});
+    return files;
+}
+
+std::optional<UInt64> MetadataStorageFromInodeDB::versionOf(const std::string & disk_path) const
+{
+    if (auto inode = statPathUncached(disk_path))
+        return inode->version();
+    return std::nullopt;
+}
+
+InodeDBCommitOutcome MetadataStorageFromInodeDB::commit(const InodeDBCommitOptions & options)
+{
+    MetadataStorageFromInodeDBTransaction transaction(*this);
+    return transaction.commitWith(&options);
 }
 
 void MetadataStorageFromInodeDB::shutdown()
@@ -1218,7 +1385,7 @@ uint64_t sizeOfRecord(const DiskObjectStorageMetadata & record)
 
 std::optional<uint64_t> MetadataStorageFromInodeDB::getFileSizeIfExists(const std::string & path) const
 {
-    auto file = readFile(path);
+    auto file = readTreeFile(path);
     if (!file)
         return std::nullopt;
     if (file->value.kind == ValueKind::String)
@@ -1250,7 +1417,7 @@ Poco::Timestamp MetadataStorageFromInodeDB::getLastModified(const std::string & 
 
 time_t MetadataStorageFromInodeDB::getLastChanged(const std::string & path) const
 {
-    if (auto file = readFile(path))
+    if (auto file = readTreeFile(path))
         return static_cast<time_t>(std::max(file->value.ctime, file->inode.mtime() / 1000));
     if (auto inode = statPath(path))
         return static_cast<time_t>(inode->mtime() / 1000);
@@ -1268,7 +1435,7 @@ struct stat MetadataStorageFromInodeDB::stat(const String & path) const
         result.st_atim = result.st_mtim;
     };
 
-    if (auto file = readFile(path))
+    if (auto file = readTreeFile(path))
     {
         result.st_ino = file->inode.handle().ino();
         result.st_mode = S_IFREG | (file->inode.mode() ? (file->inode.mode() & 07777) : 0644);
@@ -1342,7 +1509,7 @@ uint32_t MetadataStorageFromInodeDB::getHardlinkCount(const std::string & path) 
 
 std::string MetadataStorageFromInodeDB::readFileToString(const std::string & path) const
 {
-    auto file = readFile(path);
+    auto file = readTreeFile(path);
     if (!file)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "File `{}` doesn't exist", path);
     if (file->value.kind == ValueKind::Spilled)
@@ -1352,7 +1519,7 @@ std::string MetadataStorageFromInodeDB::readFileToString(const std::string & pat
 
 std::string MetadataStorageFromInodeDB::readInlineDataToString(const std::string & path) const
 {
-    auto file = readFile(path);
+    auto file = readTreeFile(path);
     if (!file)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "File `{}` doesn't exist", path);
     return recordOf(file->value, path).inline_data;
@@ -1363,7 +1530,7 @@ std::unordered_map<std::string, std::string> MetadataStorageFromInodeDB::getSeri
     std::unordered_map<std::string, std::string> result;
     for (const auto & path : file_paths)
     {
-        auto file = readFile(path);
+        auto file = readTreeFile(path);
         if (!file)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "File `{}` doesn't exist", path);
         auto record = recordOf(file->value, path);
@@ -1382,7 +1549,7 @@ StoredObjects MetadataStorageFromInodeDB::getStorageObjects(const std::string & 
 
 std::optional<StoredObjects> MetadataStorageFromInodeDB::getStorageObjectsIfExist(const std::string & path) const
 {
-    auto file = readFile(path);
+    auto file = readTreeFile(path);
     if (!file)
         return std::nullopt;
     return recordOf(file->value, path).objects;
@@ -1603,7 +1770,65 @@ MetadataStorageFromInodeDBTransaction::MetadataStorageFromInodeDBTransaction(Met
 {
 }
 
-MetadataStorageFromInodeDBTransaction::AttemptResult MetadataStorageFromInodeDBTransaction::attempt(bool read_state, bool & frees)
+namespace
+{
+
+void addPredicate(pb::Pred & pred, const InodeDBCommitOptions::Predicate & extra);
+
+pb::Op extraOp(const InodeDBCommitOptions::Op & extra)
+{
+    pb::Op op;
+    if (extra.kind == InodeDBCommitOptions::Kind::Remove)
+        op = removeAllOp(extra.path);
+    else if (extra.kind == InodeDBCommitOptions::Kind::Mkdir)
+        op = mkdirOp(extra.path, /*parents=*/ true);
+    else if (extra.kind == InodeDBCommitOptions::Kind::Rename)
+        op = renameOp(extra.path, extra.to, pb::NO_REPLACE);
+    else
+    {
+        pb::PutMode mode = pb::UPSERT;
+        switch (extra.mode)
+        {
+            case InodeDBCommitOptions::Mode::Create: mode = pb::CREATE; break;
+            case InodeDBCommitOptions::Mode::Replace: mode = pb::REPLACE; break;
+            case InodeDBCommitOptions::Mode::Upsert: mode = pb::UPSERT; break;
+        }
+        op = putOp(extra.path, extra.value, mode);
+    }
+    for (const auto & pred : extra.cond)
+        addPredicate(*op.add_cond(), pred);
+    return op;
+}
+
+void addPredicate(pb::Pred & pred, const InodeDBCommitOptions::Predicate & extra)
+{
+    switch (extra.check)
+    {
+        case InodeDBCommitOptions::Check::Exists: pred.set_exists(extra.path); break;
+        case InodeDBCommitOptions::Check::Absent: pred.set_absent(extra.path); break;
+        case InodeDBCommitOptions::Check::IsDir: pred.set_is_dir(extra.path); break;
+        case InodeDBCommitOptions::Check::VersionIs:
+            pred.mutable_version_is()->set_path(extra.path);
+            pred.mutable_version_is()->set_version(extra.version);
+            break;
+    }
+}
+
+void noteFailure(InodeDBCommitOutcome & outcome, InodeDBCommitStatus status, const std::string & path)
+{
+    if (status == InodeDBCommitStatus::Committed)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "An op or predicate on `{}` that may fail names no failure status", path);
+    /// The first failure decides the status; later ones of the same status add their paths.
+    if (outcome.status == InodeDBCommitStatus::Committed)
+        outcome.status = status;
+    if (outcome.status == status && std::ranges::find(outcome.failed_paths, path) == outcome.failed_paths.end())
+        outcome.failed_paths.push_back(path);
+}
+
+}
+
+MetadataStorageFromInodeDBTransaction::AttemptResult MetadataStorageFromInodeDBTransaction::attempt(
+    bool read_state, bool & frees, const InodeDBCommitOptions * extra, InodeDBCommitOutcome & outcome)
 {
     std::unique_lock exclusive(storage.commit_mutex, std::defer_lock);
     std::shared_lock shared(storage.commit_mutex, std::defer_lock);
@@ -1626,6 +1851,18 @@ MetadataStorageFromInodeDBTransaction::AttemptResult MetadataStorageFromInodeDBT
         throw;
     }
 
+    /// The extras follow the batch's own ops and its owner fence.
+    const int extra_ops_from = request.ops_size();
+    const int extra_when_from = request.when_size();
+    if (extra)
+    {
+        for (const auto & op : extra->ops)
+            *request.add_ops() = extraOp(op);
+        for (const auto & pred : extra->when)
+            addPredicate(*request.add_when(), pred);
+    }
+    outcome = {};
+
     /// If the call itself fails, the batch may have applied, so the blobs it wrote stay, and nothing cached
     /// can be trusted.
     pb::CommitResponse response;
@@ -1643,14 +1880,33 @@ MetadataStorageFromInodeDBTransaction::AttemptResult MetadataStorageFromInodeDBT
 
     for (int i = 0; i < response.outcomes_size(); ++i)
     {
-        const auto & outcome = response.outcomes(i);
-        if (!outcome.has_skipped() || outcome.skipped().reason_case() == pb::Skipped::kAborted)
+        const auto & op_outcome = response.outcomes(i);
+        if (!op_outcome.has_skipped() || op_outcome.skipped().reason_case() == pb::Skipped::kAborted)
             continue;
+
+        const auto & skipped = op_outcome.skipped();
+        if (skipped.reason_case() == pb::Skipped::kWhen && static_cast<int>(skipped.when()) >= extra_when_from)
+        {
+            const auto & pred = extra->when.at(skipped.when() - extra_when_from);
+            noteFailure(outcome, pred.failure, pred.path);
+            continue;
+        }
+        if (i >= extra_ops_from && skipped.reason_case() == pb::Skipped::kError)
+        {
+            const auto & extra_op = extra->ops.at(i - extra_ops_from);
+            noteFailure(outcome, extra_op.failure, extra_op.path);
+            continue;
+        }
+        if (i >= extra_ops_from && skipped.reason_case() == pb::Skipped::kCond)
+        {
+            const auto & pred = extra->ops.at(i - extra_ops_from).cond.at(skipped.cond());
+            noteFailure(outcome, pred.failure, pred.path);
+            continue;
+        }
 
         /// The batch is all-or-nothing, so nothing applied.
         storage.removeUnappliedBlobs(builder.blobsWritten());
 
-        const auto & skipped = outcome.skipped();
         if (skipped.reason_case() == pb::Skipped::kWhen)
             throw Exception(ErrorCodes::TABLE_IS_READ_ONLY,
                 "{} lost ownership: another server took over the disk, so this one can no longer write", storage.description);
@@ -1680,8 +1936,16 @@ MetadataStorageFromInodeDBTransaction::AttemptResult MetadataStorageFromInodeDBT
             "{} failed: InodeDB reports {} at `{}`", intent.describe(), pb::Error_Name(skipped.error()), opPath(op));
     }
 
+    if (outcome.status != InodeDBCommitStatus::Committed)
+    {
+        storage.removeUnappliedBlobs(builder.blobsWritten());
+        ProfileEvents::increment(ProfileEvents::InodeDBCommitConflicts);
+        return AttemptResult::ExtraFailed;
+    }
+
     storage.cache->invalidate(request, response);
     frees = builder.freesAnything();
+    outcome.version = response.version();
     return AttemptResult::Committed;
 }
 
@@ -1689,19 +1953,43 @@ void MetadataStorageFromInodeDBTransaction::commit(const TransactionCommitOption
 {
     if (!std::holds_alternative<NoCommitOptions>(options))
         throwNotImplemented();
-    if (intents.empty())
-        return;
+    commitWith(nullptr);
+}
+
+InodeDBCommitOutcome MetadataStorageFromInodeDBTransaction::commitWith(const InodeDBCommitOptions * extra)
+{
+    if (intents.empty() && (!extra || (extra->ops.empty() && extra->when.empty())))
+        return {};
     /// `DiskObjectStorage::createDirectories` commits even for directories that exist, as when a replica attaches a
     /// database from this disk. Such a transaction changes nothing, so a read-only disk commits it, as `local` does.
-    if (storage.isReadOnly() && onlyCreatesExistingDirectories())
-        return;
+    if (!extra && storage.isReadOnly() && onlyCreatesExistingDirectories())
+        return {};
     storage.assertWritable();
+
+    /// A shared writer's server changes no definitions: an exclusive writer runs DDL. Every server at startup creates
+    /// the directories definitions live in and removes leftover temporary files, which changes none.
+    if (storage.settings.shared)
+    {
+        for (const auto & intent : intents)
+        {
+            if (intent.kind == IntentKind::CreateDirectory || intent.kind == IntentKind::CreateDirectoryRecursive
+                || (intent.kind == IntentKind::UnlinkFile && intent.if_exists))
+                continue;
+            if (holdsDefinitions(intent.path) || (!intent.path_to.empty() && holdsDefinitions(intent.path_to)))
+                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                    "Changing definitions needs an exclusive writer: {} shares its disk with other writers (`inodedb_writer_mode` = 'shared'), "
+                    "and {} changes `{}`", storage.description, magic_enum::enum_name(intent.kind), intent.path);
+        }
+    }
 
     bool read_state = std::ranges::any_of(intents, [](const Intent & intent) { return intent.readsState(); });
     bool frees = false;
+    InodeDBCommitOutcome outcome;
     while (true)
     {
-        auto result = attempt(read_state, frees);
+        auto result = attempt(read_state, frees, extra, outcome);
+        if (result == AttemptResult::ExtraFailed)
+            return outcome;
         if (result == AttemptResult::Committed)
             break;
         if (result == AttemptResult::CreatedExisting)
@@ -1714,7 +2002,7 @@ void MetadataStorageFromInodeDBTransaction::commit(const TransactionCommitOption
     }
 
     if (!frees)
-        return;
+        return outcome;
 
     /// Queue the blobs this commit freed now, so the disk can wait for their removal as with local metadata.
     /// The commit stands either way: a failure here leaves them to the next pass.
@@ -1726,6 +2014,7 @@ void MetadataStorageFromInodeDBTransaction::commit(const TransactionCommitOption
     {
         tryLogCurrentException(storage.log, "Claiming freed files after a commit");
     }
+    return outcome;
 }
 
 bool MetadataStorageFromInodeDBTransaction::onlyCreatesExistingDirectories() const
@@ -1739,6 +2028,8 @@ bool MetadataStorageFromInodeDBTransaction::onlyCreatesExistingDirectories() con
 
 TransactionCommitOutcomeVariant MetadataStorageFromInodeDBTransaction::tryCommit(const TransactionCommitOptionsVariant & options)
 {
+    if (const auto * extra = std::get_if<InodeDBCommitOptions>(&options))
+        return commitWith(extra);
     commit(options);
     return true;
 }

@@ -3499,7 +3499,10 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks, std::optional<std::un
     data_parts_loading_finished = true;
 
     auto refresh_parts_interval = (*settings)[MergeTreeSetting::refresh_parts_interval].totalMilliseconds();
-    if (all_disks_are_readonly && refresh_parts_interval && !refresh_parts_task)
+    /// BigHouse: a shared writer learns the parts other writers add and remove, every second unless set.
+    if (isSharedWriter() && !refresh_parts_interval)
+        refresh_parts_interval = 1000;
+    if ((all_disks_are_readonly || isSharedWriter()) && refresh_parts_interval && !refresh_parts_task)
     {
         refresh_parts_task = getContext()->getSchedulePool()->createTask(
             getStorageID(), "MergeTreeData::refreshDataParts",
@@ -3545,6 +3548,18 @@ void MergeTreeData::refreshDataPartsOnce(UInt64 interval_milliseconds)
     for (auto & disk : getStoragePolicy()->getDisks())
         disk->refresh(interval_milliseconds);
 
+    /// BigHouse: a shared writer reads its block number counter before it lists, so the listing holds every part
+    /// numbered at or below it. Parts it held before the listing began, and only those, vanish when unlisted:
+    /// a part it commits while the listing runs may sort before a page already read.
+    const std::optional<Int64> complete_below = beginSharedRefresh();
+    NameSet active_before_listing;
+    if (complete_below)
+    {
+        auto part_lock = lockParts();
+        for (const auto & part : getDataPartsStateRange(DataPartState::Active))
+            active_before_listing.insert(part->name);
+    }
+
     Stopwatch watch;
     LOG_DEBUG(log, "Refreshing data parts");
 
@@ -3565,7 +3580,7 @@ void MergeTreeData::refreshDataPartsOnce(UInt64 interval_milliseconds)
             listings_are_exact = false;
             continue;
         }
-        if (!disk_ptr->isReadOnly())
+        if (!disk_ptr->isReadOnly() && !complete_below)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "MergeTreeData::refreshDataPartsOnce should only be called if all disks are readonly");
         listings_are_exact &= disk_ptr->getDataSourceDescription().metadata_type == MetadataStorageType::InodeDB;
 
@@ -3585,6 +3600,11 @@ void MergeTreeData::refreshDataPartsOnce(UInt64 interval_milliseconds)
         }
     }
 
+    /// BigHouse: a listing that took more than half of `old_parts_lifetime` may miss a part whose covering part's
+    /// sources other writers removed meanwhile, so it starts over at the next refresh.
+    if (complete_below && watch.elapsedSeconds() * 2 > static_cast<double>((*settings)[MergeTreeSetting::old_parts_lifetime].totalSeconds()))
+        throw Exception(ErrorCodes::ABORTED, "Listing the parts took {:.1f} s, more than half of `old_parts_lifetime`", watch.elapsedSeconds());
+
     /// BigHouse: an active part missing from an exact listing was dropped or merged away by the writer.
     /// Queries reading it keep it until they finish; the reader's InodeDB lease keeps its blobs.
     if (listings_are_exact)
@@ -3592,7 +3612,7 @@ void MergeTreeData::refreshDataPartsOnce(UInt64 interval_milliseconds)
         auto part_lock = lockParts();
         DataPartsVector vanished;
         for (const auto & part : getDataPartsStateRange(DataPartState::Active))
-            if (!listed_part_names.contains(part->name))
+            if (!listed_part_names.contains(part->name) && (!complete_below || active_before_listing.contains(part->name)))
                 vanished.push_back(part);
         if (!vanished.empty())
         {
@@ -3638,6 +3658,10 @@ void MergeTreeData::refreshDataPartsOnce(UInt64 interval_milliseconds)
             my_part->info, my_part->name, my_part->disk,
             DataPartState::PreActive, data_parts_mutex, loading_parts_initial_backoff_ms,
             loading_parts_max_backoff_ms, loading_parts_max_tries);
+
+        /// BigHouse: a shared writer's own insert or merge added the part, under the parts lock, after it was listed.
+        if (res.part->is_duplicate)
+            continue;
 
         /// A part loaded `Outdated` (e.g. rolled back) must not be committed: that would reset it to `PreActive`.
         if (res.is_broken || res.part->getState() == DataPartState::Outdated)
@@ -3691,6 +3715,9 @@ void MergeTreeData::refreshDataPartsOnce(UInt64 interval_milliseconds)
     transactions_enabled = have_parts_with_version_metadata;
 
     auto old_parts = grabOldParts(true);
+
+    if (complete_below)
+        endSharedRefresh(*complete_below);
 
     watch.stop();
     LOG_DEBUG(log, "Refreshing data parts (added {} items, removed {} items) took {:.3f} seconds",
@@ -5210,6 +5237,7 @@ size_t MergeTreeData::clearUnusedPatchParts()
 
 void MergeTreeData::rename(const String & new_table_path, const StorageID & new_table_id)
 {
+    assertExclusiveWriter("RENAME");
     LOG_INFO(log, "Renaming table to path {} with ID {}", new_table_path, new_table_id.getFullTableName());
 
     auto disks = getStoragePolicy()->getDisks();
@@ -9680,6 +9708,8 @@ Pipe MergeTreeData::alterPartition(
     const PartitionCommands & commands,
     ContextPtr query_context)
 {
+    if (!commands.empty())
+        assertExclusiveWriter("A partition command");
     /// TODO(unique-key): support ALTER ... PARTITION.
     if (hasUniqueKey() && !commands.empty())
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
@@ -13619,6 +13649,7 @@ bool MergeTreeData::canReplacePartition(const DataPartPtr & src_part) const
 
 void MergeTreeData::checkTableCanBeDropped(ContextPtr query_context) const
 {
+    assertExclusiveWriter("DROP TABLE");
     checkTableSizeBelowDropLimit(query_context);
 }
 

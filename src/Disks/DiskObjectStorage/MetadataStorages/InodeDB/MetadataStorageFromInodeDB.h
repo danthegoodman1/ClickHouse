@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/InMemoryRemovalQueue.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/InodeDB/InodeDBClient.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/InodeDB/InodeDBCoordination.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/InodeDB/InodeDBMetadataCache.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/InodeDB/InodeDBValue.h>
 
@@ -40,16 +41,27 @@ struct InodeDBMetadataSettings
     std::chrono::milliseconds lease_lag{600'000};
     /// What the metadata cache holds at most; zero turns it off.
     size_t cache_bytes = 256 << 20;
+    /// `inodedb_writer_mode` = `shared`: the writer joins other shared writers instead of fencing them.
+    bool shared = false;
+    /// How long a shared writer keeps a deduplication token.
+    std::chrono::seconds token_ttl{3600};
+    /// How long a merge claim lasts unless its holder renews it.
+    std::chrono::milliseconds claim_ttl{60'000};
 };
 
 class InodeDBReaderLease;
 
 /// Metadata of an object-storage disk kept in InodeDB, a transactional tree of inodes.
 ///
-/// The key's root holds three entries:
+/// The key's root holds four entries:
 ///   `tree/`   the disk's files and directories;
-///   `owner`   the fence: a writer bumps it at startup and conditions every commit on its version;
-///   `trash/`  where tombstones are created and unlinked.
+///   `owner`   the fence: every commit requires the version a writer found or wrote at startup;
+///   `trash/`  where tombstones are created and unlinked;
+///   `coord/`  coordination files of MergeTree tables (`IInodeDBCoordination`).
+///
+/// An exclusive writer (`inodedb_writer_mode` = `exclusive`) writes `owner` at startup, which fences every other
+/// writer. A shared writer joins the shared owner it finds, or replaces an exclusive one, so shared writers commit
+/// side by side until an exclusive writer starts.
 ///
 /// A file's value is an `InodeDB::Value`. Directories, renames and hardlinks are InodeDB's own, so a rename is
 /// one entry change and a hardlink shares the inode. Each transaction commits as one all-or-nothing batch.
@@ -58,7 +70,7 @@ class InodeDBReaderLease;
 ///   - a file whose last link goes carries its final record, whose blobs go unless the record is `retained`;
 ///   - blobs a transaction drops from a live file (truncate, overwrite) go in a tombstone;
 ///   - a value that `Put` replaced deletes nothing, since its transaction wrote a tombstone for what it dropped.
-class MetadataStorageFromInodeDB final : public IMetadataStorage
+class MetadataStorageFromInodeDB final : public IMetadataStorage, public IInodeDBCoordination
 {
 public:
     MetadataStorageFromInodeDB(
@@ -123,7 +135,17 @@ public:
     int64_t getDeadBlobsQueueEstimate() override;
 
     /// The InodeDB path of a disk path: `tree/<path>`, without trailing slashes.
-    static std::string treePath(const std::string & path);
+    static std::string treePath(const std::string & path) { return IInodeDBCoordination::treePath(path); }
+
+    bool isSharedWriter() const override { return settings.shared; }
+    const std::string & writerId() const override { return writer_id; }
+    std::chrono::seconds tokenTTL() const override { return settings.token_ttl; }
+    std::chrono::milliseconds claimTTL() const override { return settings.claim_ttl; }
+    std::optional<IInodeDBCoordination::File> readFile(const std::string & path) const override;
+    std::vector<std::optional<IInodeDBCoordination::File>> readFiles(const std::vector<std::string> & paths) const override;
+    std::vector<std::pair<std::string, IInodeDBCoordination::File>> listFiles(const std::string & dir) const override;
+    std::optional<UInt64> versionOf(const std::string & disk_path) const override;
+    InodeDBCommitOutcome commit(const InodeDBCommitOptions & options) override;
 
 private:
     friend class MetadataStorageFromInodeDBTransaction;
@@ -137,7 +159,7 @@ private:
 
     /// The file at the InodeDB path, or nothing when no file is there.
     std::optional<File> readFileAt(const std::string & inodedb_path) const;
-    std::optional<File> readFile(const std::string & path) const { return readFileAt(treePath(path)); }
+    std::optional<File> readTreeFile(const std::string & path) const { return readFileAt(treePath(path)); }
     /// The inode at a disk path, or nothing when the path names nothing.
     std::optional<InodeDB::pb::Inode> statPath(const std::string & path) const;
     /// The same, read from InodeDB: a cached link count misses what removing another name's directory took.
@@ -160,6 +182,8 @@ private:
     void removeUnappliedBlobs(const std::vector<std::string> & keys) const noexcept;
 
     void assertWritable() const;
+    /// Joins the shared owner, or replaces an exclusive one under its version.
+    void joinSharedOwner();
 
     /// Claims released free-queue entries and queues their blobs. Returns the blobs it queued.
     StoredObjects pullFreedUnlocked() TSA_REQUIRES(removal_mutex);
@@ -175,15 +199,18 @@ private:
     const std::string description;
     const LoggerPtr log;
     const std::unique_ptr<InodeDB::MetadataCache> cache;
+    const std::string writer_id;
 
-    /// The version of `owner` this server wrote; every commit requires it. Zero before `startup`.
+    /// The version of `owner` this server wrote or joined; every commit requires it. Zero before `startup`.
     std::atomic<UInt64> owner_version = 0;
 
-    /// A replica's lease, from `startup` to `shutdown`.
+    /// The lease of a replica or a shared writer, from `startup` to `shutdown`. A shared writer reads parts that
+    /// other writers may remove.
     std::unique_ptr<InodeDBReaderLease> reader_lease;
 
-    /// Transactions that read before they write hold it exclusively; the rest share it. This server is the
-    /// only writer under its key's root, so an exclusive holder reads exactly what its batch applies to.
+    /// Transactions that read before they write hold it exclusively; the rest share it. An exclusive writer is the
+    /// only one under its key's root, so an exclusive holder reads exactly what its batch applies to. Shared
+    /// writers change only their own parts' files and coordination files, which every batch checks in InodeDB.
     mutable SharedMutex commit_mutex;
 
     struct FreedEntry
@@ -250,7 +277,10 @@ public:
     explicit MetadataStorageFromInodeDBTransaction(MetadataStorageFromInodeDB & storage_);
 
     void commit(const TransactionCommitOptionsVariant & options) override;
+    /// With `InodeDBCommitOptions`, returns an `InodeDBCommitOutcome` and keeps the intents, so the caller can retry.
     TransactionCommitOutcomeVariant tryCommit(const TransactionCommitOptionsVariant & options) override;
+    /// Commits the intents with `extra` joined to the batch.
+    InodeDBCommitOutcome commitWith(const InodeDBCommitOptions * extra);
 
     void writeStringToFile(const std::string & path, const std::string & data) override;
     void writeInlineDataToFile(const std::string & path, const std::string & data) override;
@@ -279,13 +309,15 @@ private:
     enum class AttemptResult : uint8_t
     {
         Committed,
+        /// An op or predicate of `InodeDBCommitOptions` failed; the outcome says which.
+        ExtraFailed,
         /// A file the batch created without reading already existed.
         CreatedExisting,
         /// An `if_exists` removal found a file where its path needs a directory; it is now marked `skip`.
         SkippedRemoval,
     };
 
-    AttemptResult attempt(bool read_state, bool & frees);
+    AttemptResult attempt(bool read_state, bool & frees, const InodeDBCommitOptions * extra, InodeDBCommitOutcome & outcome);
     /// Whether every intent creates a directory that exists already, so the transaction changes nothing.
     bool onlyCreatesExistingDirectories() const;
 

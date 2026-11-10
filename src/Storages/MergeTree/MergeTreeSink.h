@@ -72,6 +72,9 @@ protected:
     std::unique_ptr<MergeTreeDelayedChunk> delayed_chunk;
 
     std::vector<std::string> commitPart(MutableDataPartPtr & part, const std::vector<DeduplicationHash> & deduplication_hashes);
+    /// BigHouse: commits a part on a writable `inodedb` disk in one batch with its deduplication tokens and, for a
+    /// writer that shares the disk, its block number and the table's definition version.
+    std::vector<std::string> commitPartOnInodeDB(MutableDataPartPtr & part, const std::vector<std::string> & block_ids);
     virtual void finishDelayedChunk();
     virtual TemporaryPartPtr writeNewTempPart(BlockWithPartition & block);
 };

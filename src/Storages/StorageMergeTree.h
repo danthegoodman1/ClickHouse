@@ -30,6 +30,7 @@ namespace DB
 {
 
 class PreparedSetsCache;
+class InodeDBTableCoordinator;
 using PreparedSetsCachePtr = std::shared_ptr<PreparedSetsCache>;
 
 /** See the description of the data structure in MergeTreeData.
@@ -129,7 +130,37 @@ public:
 
     MergeTreeDeduplicationLog * getDeduplicationLog() { return deduplication_log.get(); }
 
+    /// BigHouse: the table's coordination on a writable `inodedb` disk, or nullptr on other disks.
+    InodeDBTableCoordinator * getInodeDBCoordinator() const { return inodedb_coordinator.get(); }
+    bool isSharedWriter() const override;
+    void assertExclusiveWriter(std::string_view operation) const override;
+    std::string getPostfixForTempInsertName() const override;
+
 private:
+    /// BigHouse: see `InodeDBTableCoordinator`.
+    std::shared_ptr<InodeDBTableCoordinator> inodedb_coordinator;
+    /// BigHouse: a shared writer merges only parts numbered up to this block, below which its last refresh saw
+    /// every part.
+    std::atomic<Int64> shared_complete_below = 0;
+    /// BigHouse: parts whose claims another writer holds, and when this writer may try them again.
+    mutable std::mutex claimed_elsewhere_mutex;
+    std::unordered_map<String, std::chrono::steady_clock::time_point> claimed_elsewhere;
+    /// BigHouse: renews a shared writer's merge claims.
+    BackgroundSchedulePoolTaskHolder inodedb_claims_task;
+
+    std::optional<Int64> beginSharedRefresh() override;
+    void endSharedRefresh(Int64 complete_below) override;
+    /// BigHouse: why a shared writer leaves a part out of merges, if it does.
+    std::optional<PreformattedMessage> sharedWriterCannotMerge(const MergeTreeData::DataPartPtr & part) const;
+    /// BigHouse: claims a merge's sources; false when another writer holds one.
+    bool claimMergeSources(const FutureMergedMutatedPart & future_part);
+    /// BigHouse: renames a merged part in its open transaction and commits both with the checks of its claims.
+    void commitSharedMergedPart(MutableDataPartPtr & part, const String & result, DataPartsLock & lock);
+    /// BigHouse: removes the deduplication tokens of dropped parts.
+    void dropDeduplicationTokens(const DataPartsVector & parts);
+    /// BigHouse: a shared writer's cleanup of tokens and claims.
+    size_t clearSharedWriterCoordination();
+
 
     /// Mutex and condvar for synchronous mutations wait
     std::mutex mutation_wait_mutex;

@@ -73,6 +73,14 @@ void registerMetadataStorageFromInodeDB(MetadataStorageFactory & factory)
         settings.inline_file_max_bytes = config.getUInt64(config_prefix + ".inodedb_inline_file_max_bytes", settings.inline_file_max_bytes);
         settings.lease_lag = std::chrono::milliseconds(config.getUInt64(config_prefix + ".inodedb_lease_lag_ms", settings.lease_lag.count()));
         settings.cache_bytes = config.getUInt64(config_prefix + ".inodedb_cache_bytes", settings.cache_bytes);
+        const auto mode = config.getString(config_prefix + ".inodedb_writer_mode", "exclusive");
+        if (mode != "exclusive" && mode != "shared")
+            throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "`inodedb_writer_mode` is `exclusive` or `shared`, not `{}`", mode);
+        settings.shared = mode == "shared";
+        if (settings.shared && settings.read_only)
+            throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "A read-only `inodedb` disk takes no `inodedb_writer_mode`");
+        settings.token_ttl = std::chrono::seconds(config.getUInt64(config_prefix + ".inodedb_deduplication_token_ttl_seconds", settings.token_ttl.count()));
+        settings.claim_ttl = std::chrono::milliseconds(config.getUInt64(config_prefix + ".inodedb_claim_ttl_ms", settings.claim_ttl.count()));
         if (settings.spill_threshold == 0 || settings.spill_threshold > 48 * 1024)
             throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "`inodedb_spill_threshold` must be between 1 and 49152 bytes, since an InodeDB value holds 64 KiB");
         if (settings.inline_file_max_bytes >= settings.spill_threshold)

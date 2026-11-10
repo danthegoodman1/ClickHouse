@@ -1582,8 +1582,18 @@ public:
     /// Y. rename temporary directory to final name with correct block number value
     /// As temp name MergeTree use just ordinary in memory counter, but in some cases
     /// it can be useful to add additional part in temp name to avoid collisions on FS.
-    /// FIXME: Currently unused.
+    /// BigHouse: writers that share an `inodedb` disk add their writer id.
     virtual std::string getPostfixForTempInsertName() const { return ""; }
+
+    /// BigHouse: whether this table's writer shares its `inodedb` disk with other writers.
+    virtual bool isSharedWriter() const { return false; }
+    /// BigHouse: throws for a write that only an exclusive writer of an `inodedb` disk makes.
+    virtual void assertExclusiveWriter(std::string_view /* operation */) const {}
+    /// BigHouse: a shared writer reads its table's block number counter before a refresh lists the parts. The listing
+    /// then holds every part numbered at or below it, or a part that covers it.
+    virtual std::optional<Int64> beginSharedRefresh() { return std::nullopt; }
+    /// BigHouse: the counter `beginSharedRefresh` read, once the refresh has loaded the parts it listed.
+    virtual void endSharedRefresh(Int64 /* complete_below */) {}
 
     /// For generating names of temporary parts during insertion.
     SimpleIncrement insert_increment;
@@ -2069,6 +2079,8 @@ protected:
     // Partition helpers
     bool canReplacePartition(const DataPartPtr & src_part) const;
     void checkTableCanBeDropped(ContextPtr query_context) const override;
+    /// BigHouse: a shared writer renames no table.
+    void checkTableCanBeRenamed(const StorageID & /* new_name */) const override { assertExclusiveWriter("RENAME"); }
     void checkTableSizeBelowDropLimit(ContextPtr query_context) const override;
 
     /// Tries to drop part in background without any waits or throwing exceptions in case of errors.

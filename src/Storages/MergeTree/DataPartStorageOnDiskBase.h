@@ -173,6 +173,8 @@ public:
 
     SyncGuardPtr getDirectorySyncGuard() const override;
     bool hasActiveTransaction() const override;
+    /// BigHouse: see `IDataPartStorage::commitTransactionWith`.
+    InodeDBCommitOutcome commitTransactionWith(const InodeDBCommitOptions & options) override;
 
     bool isCaseInsensitive() const override;
 

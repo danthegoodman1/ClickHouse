@@ -1898,6 +1898,10 @@ The server successfully detected this situation and will download merged part fr
     M(InodeDBMintKey, "Number of InodeDB `MintKey` calls.", ValueType::Number) \
     M(InodeDBRetries, "Number of InodeDB call attempts retried after the server was unavailable or slow to answer.", ValueType::Number) \
     M(InodeDBMicroseconds, "Total time spent in InodeDB calls, retries included.", ValueType::Microseconds) \
+    M(InodeDBCommitConflicts, "Number of `inodedb` commits that applied nothing because coordination state changed: a block number counter, a deduplication token, a table's definition or a merge claim.", ValueType::Number) \
+    M(InodeDBCommitRetries, "Number of `inodedb` commits a shared writer retried with a new block number after another writer took the one it tried.", ValueType::Number) \
+    M(InodeDBClaimsTaken, "Number of merge claims an `inodedb` shared writer took, an expired claim of another writer among them.", ValueType::Number) \
+    M(InodeDBClaimsLost, "Number of merges an `inodedb` shared writer abandoned because another writer holds a claim on a source part or took one over.", ValueType::Number) \
     \
 
 #ifdef APPLY_FOR_EXTERNAL_EVENTS

@@ -749,6 +749,11 @@ void DataPartStorageOnDiskBase::rename(
 
     String to = fs::path(new_root_path) / new_part_dir / "";
 
+    /// BigHouse: a part that an `inodedb` writer committed under its final name renames onto itself, which, as
+    /// with `rename(2)`, changes nothing.
+    if ((fs::path(getRelativePath()) / "").lexically_normal() == fs::path(to).lexically_normal())
+        return;
+
     if (volume->getDisk()->existsDirectory(to))
     {
         /// FIXME it should be logical error
@@ -1156,6 +1161,21 @@ void DataPartStorageOnDiskBase::createDirectories()
 bool DataPartStorageOnDiskBase::hasActiveTransaction() const
 {
     return transaction != nullptr;
+}
+
+InodeDBCommitOutcome DataPartStorageOnDiskBase::commitTransactionWith(const InodeDBCommitOptions & options)
+{
+    /// BigHouse: only a storage that keeps a new part's transaction open until its rename commits through here.
+    if (!transaction || has_shared_transaction || !commitsNewPartWithRename())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Part {} has no open transaction of its own to commit with `inodedb` options", part_dir);
+
+    auto result = transaction->tryCommit(options);
+    const auto * outcome = std::get_if<InodeDBCommitOutcome>(&result);
+    if (!outcome)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Disk {} answered a commit with `inodedb` options with another kind of outcome", getDiskName());
+    if (outcome->status == InodeDBCommitStatus::Committed)
+        transaction.reset();
+    return *outcome;
 }
 
 bool DataPartStorageOnDiskBase::isCaseInsensitive() const

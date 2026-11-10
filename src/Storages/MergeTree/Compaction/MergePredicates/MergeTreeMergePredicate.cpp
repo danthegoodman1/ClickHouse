@@ -187,6 +187,10 @@ std::expected<void, PreformattedMessage> MergeTreeMergePredicate::canUsePartInMe
     if (storage.currently_merging_mutating_parts.contains(part->info))
         return std::unexpected(PreformattedMessage::create("Part {} currently in a merging or mutating process", part->name));
 
+    /// BigHouse: a shared writer merges only parts its last refresh saw complete, and leaves others' claims alone.
+    if (auto reason = storage.sharedWriterCannotMerge(part))
+        return std::unexpected(std::move(*reason));
+
     if (min_update_block && part->info.getDataVersion() >= *min_update_block)
     {
         return std::unexpected(

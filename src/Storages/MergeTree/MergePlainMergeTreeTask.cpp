@@ -1,6 +1,7 @@
 #include <Storages/MergeTree/MergePlainMergeTreeTask.h>
 #include <Storages/MergeTree/StatisticsCache.h>
 #include <Common/CurrentThread.h>
+#include <Common/FailPoint.h>
 #include <Common/ThreadGroupSwitcher.h>
 
 #include <Storages/MergeTree/MergeTreeData.h>
@@ -18,6 +19,11 @@
 
 namespace DB
 {
+
+namespace FailPoints
+{
+    extern const char inodedb_merge_pause_before_commit[];
+}
 
 namespace ErrorCodes
 {
@@ -148,18 +154,35 @@ void MergePlainMergeTreeTask::prepare()
         deduplicate_by_columns,
         cleanup,
         storage.merging_params,
-        txn);
+        txn,
+        /*projection=*/ nullptr,
+        /*parent_part=*/ nullptr,
+        /// BigHouse: a shared writer's temporary directory carries its id, so writers merging alike never share one.
+        storage.isSharedWriter() ? "_" + storage.getPostfixForTempInsertName() : "");
 }
 
 
 void MergePlainMergeTreeTask::finish()
 {
     new_part = merge_task->getFuture().get();
-    new_part->getDataPartStorage().commitTransaction();
 
     MergeTreeData::Transaction transaction(storage, txn.get());
-    storage.merger_mutator.renameMergedTemporaryPart(new_part, future_part->parts, txn, transaction);
-    transaction.commit();
+    if (storage.isSharedWriter())
+    {
+        FailPointInjection::pauseFailPoint(FailPoints::inodedb_merge_pause_before_commit);
+        /// BigHouse: one batch commits the merged part's files and rename with its claims' checks. The parts lock
+        /// spans the commit and the part's entry into the table, so a refresh that lists the part finds it there.
+        auto lock = storage.lockParts();
+        storage.commitSharedMergedPart(new_part, future_part->name, lock);
+        storage.renameTempPartAndReplaceUnlocked(new_part, lock, transaction, /*rename_in_transaction=*/ false);
+        transaction.commit(lock);
+    }
+    else
+    {
+        new_part->getDataPartStorage().commitTransaction();
+        storage.merger_mutator.renameMergedTemporaryPart(new_part, future_part->parts, txn, transaction);
+        transaction.commit();
+    }
 
     ThreadFuzzer::maybeInjectSleep();
     ThreadFuzzer::maybeInjectMemoryLimitException();

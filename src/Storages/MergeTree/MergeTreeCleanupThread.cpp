@@ -59,9 +59,18 @@ Float32 MergeTreeCleanupThread::iterate()
             static_cast<double>((*storage_settings)[MergeTreeSetting::merge_tree_clear_old_parts_interval_seconds])))
     {
         cleaned_parts += storage.clearOldPartsFromFilesystem(/* force */ false, /* with_pause_point */ true);
-        cleaned_other += storage.clearOldMutations();
-        cleaned_part_like += storage.clearEmptyParts();
-        cleaned_part_like += storage.clearUnusedPatchParts();
+        /// BigHouse: mutations, empty parts and patch parts belong to an exclusive writer; a shared writer expires its
+        /// tokens and the claims dead writers left.
+        if (storage.isSharedWriter())
+        {
+            cleaned_other += storage.clearSharedWriterCoordination();
+        }
+        else
+        {
+            cleaned_other += storage.clearOldMutations();
+            cleaned_part_like += storage.clearEmptyParts();
+            cleaned_part_like += storage.clearUnusedPatchParts();
+        }
         cleaned_part_like += storage.unloadPrimaryKeysAndClearCachesOfOutdatedParts();
     }
 

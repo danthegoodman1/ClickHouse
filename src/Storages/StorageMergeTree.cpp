@@ -1,4 +1,7 @@
 #include <Storages/StorageMergeTree.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/InodeDB/InodeDBTableCoordinator.h>
+#include <Databases/IDatabase.h>
+#include <magic_enum.hpp>
 #include <Storages/StorageProxy.h>
 
 #include <optional>
@@ -81,6 +84,7 @@
 
 namespace ProfileEvents
 {
+    extern const Event InodeDBClaimsLost;
     extern const Event PatchesAcquireLockTries;
     extern const Event PatchesAcquireLockMicroseconds;
     extern const Event MergesRejectedByMemoryLimit;
@@ -98,6 +102,8 @@ namespace DB
 
 namespace FailPoints
 {
+    extern const char inodedb_shared_merge_past_refresh[];
+    extern const char inodedb_shared_startup_cleanup[];
     extern const char storage_merge_tree_background_clear_old_parts_pause[];
     extern const char storage_merge_tree_load_mutations_pause_before_read[];
     extern const char mt_merge_selecting_task_pause_when_scheduled[];
@@ -250,6 +256,12 @@ StorageMergeTree::StorageMergeTree(
     , cleanup_thread(*this)
     , support_transaction(supportTransaction(getDisks(), log.load()))
 {
+    /// BigHouse: a table on a writable `inodedb` disk keeps its tokens there, and a shared writer its block numbers,
+    /// definition version and merge claims.
+    inodedb_coordinator = InodeDBTableCoordinator::create(getStoragePolicy(), relative_data_path_, log.load());
+    if (mode < LoadingStrictnessLevel::ATTACH)
+        assertExclusiveWriter("CREATE TABLE");
+
     initializeDirectoriesAndFormatVersion(relative_data_path_, LoadingStrictnessLevel::ATTACH <= mode, date_column_name);
 
     loadDataParts(LoadingStrictnessLevel::FORCE_RESTORE <= mode, std::nullopt);
@@ -264,6 +276,10 @@ StorageMergeTree::StorageMergeTree(
     increment.set(getMaxBlockNumber());
 
     loadMutations();
+    /// BigHouse: a shared writer joined its epoch, which fences every exclusive writer, before it loaded the parts,
+    /// so the counter it raises here is above every number in use, mutations' versions included.
+    if (isSharedWriter())
+        inodedb_coordinator->reconcileCounter(increment.value.load());
     loadDeduplicationLog();
     prewarmCaches(getActivePartsLoadingThreadPool().get(), getCachesToPrewarm(0));
 }
@@ -280,13 +296,45 @@ void StorageMergeTree::startup()
         return;
 
     const bool readonly = isTableReadonly();
-    if (!readonly)
+    /// BigHouse: the temporary directories of a shared disk belong to other writers' running inserts and merges too,
+    /// and empty parts to the exclusive writer; the background cleanup removes a shared writer's own.
+    bool startup_cleanup = !isSharedWriter();
+    fiu_do_on(FailPoints::inodedb_shared_startup_cleanup, { startup_cleanup = true; });
+    if (!readonly && startup_cleanup)
     {
         clearEmptyParts();
 
         /// Temporary directories contain incomplete results of merges (after forced restart)
         /// and don't allow to reinitialize them, so delete each of them immediately
         clearOldTemporaryDirectories(0, ROOT_TEMPORARY_DIRECTORY_PREFIXES_FOR_RECOVERY);
+    }
+
+    /// BigHouse: a shared writer's commits require the version of the definition it loaded.
+    if (isSharedWriter())
+    {
+        const auto table_id = getStorageID();
+        auto database = DatabaseCatalog::instance().tryGetDatabase(table_id.database_name);
+        if (database && getInodeDBCoordination(database->getDisk()).get() == &inodedb_coordinator->coordination())
+            inodedb_coordinator->setDefinition(database->getObjectMetadataPath(table_id.table_name));
+        else
+            inodedb_coordinator->setDefinitionError(fmt::format("the database `{}` keeps its definitions on another disk", table_id.database_name));
+
+        if (!inodedb_claims_task)
+        {
+            inodedb_claims_task = getContext()->getSchedulePool()->createTask(table_id, "StorageMergeTree::renewClaims", [this]
+            {
+                try
+                {
+                    inodedb_coordinator->renewClaims();
+                }
+                catch (...)
+                {
+                    tryLogCurrentException(log, "Renewing merge claims");
+                }
+                inodedb_claims_task->scheduleAfter(static_cast<size_t>(inodedb_coordinator->coordination().claimTTL().count() / 3));
+            });
+        }
+        inodedb_claims_task->activateAndSchedule();
     }
 
     /// NOTE background task will also clean runtime temporary directories periodically.
@@ -390,6 +438,8 @@ void StorageMergeTree::stopAllBackgroundTasks()
 {
     if (refresh_parts_task)
         refresh_parts_task->deactivate();
+    if (inodedb_claims_task)
+        inodedb_claims_task->deactivate();
     stopOutdatedAndUnexpectedDataPartsLoadingTask();
     cleanup_thread.stop();
     background_operations_assignee.finish();
@@ -508,6 +558,7 @@ StorageMergeTree::write(const ASTPtr & /*query*/, const StorageMetadataPtr & met
 
 void StorageMergeTree::drop()
 {
+    assertExclusiveWriter("DROP TABLE");
     shutdown(true);
     dropAllData();
 }
@@ -549,6 +600,7 @@ void StorageMergeTree::alter(
     DDLGuardPtr & ddl_guard)
 {
     auto component_guard = Coordination::setCurrentComponent("StorageMergeTree::alter");
+    assertExclusiveWriter("ALTER");
 
     /// Allow MODIFY_SETTING/RESET_SETTING through even when the table is readonly,
     /// so that the `table_readonly` flag can be toggled back. Everything else is rejected for a
@@ -1084,6 +1136,8 @@ void StorageMergeTree::alter(
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Deduplication for non-replicated MergeTree in old syntax is not supported");
 
             deduplication_log->setDeduplicationWindowSize((*new_storage_settings)[MergeTreeSetting::non_replicated_deduplication_window]);
+        if (inodedb_coordinator)
+            inodedb_coordinator->setWindow((*new_storage_settings)[MergeTreeSetting::non_replicated_deduplication_window]);
         }
     }
 }
@@ -1155,6 +1209,10 @@ CurrentlyMergingPartsTagger::CurrentlyMergingPartsTagger(
 
 void CurrentlyMergingPartsTagger::finalize()
 {
+    /// BigHouse: a shared writer's merge that did not commit gives up its claims.
+    if (storage.isSharedWriter())
+        storage.inodedb_coordinator->endMerge(future_part->name);
+
     std::lock_guard lock(storage.currently_processing_in_background_mutex);
     finalized = true;
 
@@ -1438,6 +1496,7 @@ void StorageMergeTree::setMutationCSN(const String & mutation_id, CSN csn)
 void StorageMergeTree::mutate(const MutationCommands & commands, ContextPtr query_context)
 {
     assertNotReadonly();
+    assertExclusiveWriter("A mutation");
 
     delayMutationOrThrowIfNeeded(nullptr, query_context);
 
@@ -1521,6 +1580,9 @@ std::unique_ptr<PlainLightweightUpdateLock> StorageMergeTree::getLockForLightwei
 QueryPipeline StorageMergeTree::updateLightweight(const MutationCommands & commands, ContextPtr query_context)
 {
     assertNotReadonly();
+    /// BigHouse: a patch part takes its block number before it is written and stores it in its data, so no counter
+    /// in its batch can number it.
+    assertExclusiveWriter("A lightweight update");
     auto context_copy = Context::createCopy(query_context);
 
     PlainLightweightUpdateHolder update_holder;
@@ -1856,6 +1918,13 @@ void StorageMergeTree::loadDeduplicationLog()
     auto disk = getDisks()[0];
     std::string path = fs::path(relative_data_path) / DEDUPLICATION_LOGS_DIR_NAME;
 
+    /// BigHouse: on a writable `inodedb` disk, tokens committed with each part take the log's place.
+    if (inodedb_coordinator)
+    {
+        inodedb_coordinator->loadTokens((*settings)[MergeTreeSetting::non_replicated_deduplication_window]);
+        return;
+    }
+
     /// Deduplication log only matters on INSERTs.
     if (!disk->isReadOnly())
     {
@@ -2077,8 +2146,26 @@ std::expected<MergeMutateSelectedEntryPtr, SelectMergeFailure> StorageMergeTree:
             throw Exception(ErrorCodes::FAULT_INJECTED, "Failpoint mt_fail_selected_merge_before_start_once is triggered");
         });
 
+        /// BigHouse: a shared writer claims the sources before the merge starts. A tagger that cannot be made, for lack
+        /// of disk space, gives the claims up; once made, it gives them up when it finishes unless the merge committed.
+        if (isSharedWriter() && !claimMergeSources(*future_part))
+            return std::unexpected(SelectMergeFailure{
+                .reason = SelectMergeFailure::Reason::CANNOT_SELECT,
+                .explanation = PreformattedMessage::create("Another writer holds a claim on a source part of {}", future_part->name),
+            });
+
         uint64_t needed_disk_space = CompactionStatistics::estimateNeededDiskSpace(future_part->parts, true);
-        auto tagger = std::make_unique<CurrentlyMergingPartsTagger>(future_part, needed_disk_space, *this, metadata_snapshot, false);
+        std::unique_ptr<CurrentlyMergingPartsTagger> tagger;
+        try
+        {
+            tagger = std::make_unique<CurrentlyMergingPartsTagger>(future_part, needed_disk_space, *this, metadata_snapshot, false);
+        }
+        catch (...)
+        {
+            if (isSharedWriter())
+                inodedb_coordinator->endMerge(future_part->name);
+            throw;
+        }
 
         auto entry = std::make_shared<MergeMutateSelectedEntry>(future_part, std::move(tagger), std::make_shared<MutationCommands>());
         entry->ttl_merge_slot = std::move(ttl_merge_slot);
@@ -2758,7 +2845,8 @@ bool StorageMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & assign
                 LOG_TRACE(LogFrequencyLimiter(log.load(), 300), "Didn't start merge: {}", merge_select_result.error().explanation.text);
         }
 
-        if (!merge_entry && !current_mutations_by_version.empty())
+        /// BigHouse: a shared writer leaves mutations to an exclusive writer.
+        if (!merge_entry && !current_mutations_by_version.empty() && !isSharedWriter())
         {
             PreformattedMessage out_reason;
             mutate_entry = selectPartsToMutate(metadata_snapshot, out_reason, shared_lock, lock);
@@ -3123,6 +3211,24 @@ size_t StorageMergeTree::clearOldPartsFromFilesystem(bool force, bool with_pause
     if (parts_to_remove.empty())
         return 0;
 
+    /// BigHouse: a shared writer removes the directories of parts it merged away. Another writer's merge covered
+    /// the rest, or removed them already, and that writer removes their directories: this one only forgets them.
+    if (isSharedWriter())
+    {
+        DataPartsVector others;
+        std::erase_if(parts_to_remove, [&](const DataPartPtr & part)
+        {
+            if (inodedb_coordinator->mergedByThisWriter(part->name))
+                return false;
+            others.push_back(part);
+            return true;
+        });
+        if (!others.empty())
+            removePartsFinally(others);
+        if (parts_to_remove.empty())
+            return others.size();
+    }
+
     if (with_pause_fail_point)
     {
         // storage_merge_tree_background_clear_old_parts_pause is set after grabOldParts intentionally
@@ -3137,6 +3243,17 @@ size_t StorageMergeTree::clearOldPartsFromFilesystem(bool force, bool with_pause
     }
 
     clearPartsFromFilesystemAndRollbackIfError(parts_to_remove, "old");
+
+    /// BigHouse: a claim on a source part goes only once its directory is gone, so a writer whose view is stale
+    /// finds the claim or no source to merge.
+    if (isSharedWriter())
+    {
+        std::vector<String> removed;
+        for (const auto & part : parts_to_remove)
+            if (!part->getDataPartStorage().exists())
+                removed.push_back(part->name);
+        inodedb_coordinator->removeClaims(removed);
+    }
 
     /// This is needed to close files to avoid they reside on disk after being deleted.
     /// NOTE: we can drop files from cache more selectively but this is good enough.
@@ -3156,6 +3273,10 @@ bool StorageMergeTree::optimize(
     ContextPtr local_context)
 {
     assertNotReadonly();
+
+    /// BigHouse: a shared writer merges only parts its last refresh saw complete, so OPTIMIZE refreshes first.
+    if (isSharedWriter())
+        refreshDataPartsOnce(0);
 
     auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
 
@@ -3469,6 +3590,7 @@ void StorageMergeTree::dropPartNoWaitNoThrow(const String & part_name)
         {
             deduplication_log->dropPart(part->info);
         }
+        dropDeduplicationTokens({part});
 
         /// Need to destroy part objects before clearing them from filesystem.
         part.reset();
@@ -3707,6 +3829,7 @@ DataPartsVector StorageMergeTree::renameAndCommitEmptyParts(MutableDataPartsVect
     if (deduplication_log)
         for (const auto & part : removed_parts)
             deduplication_log->dropPart(part->info);
+    dropDeduplicationTokens(removed_parts);
 
     return removed_parts;
 }
@@ -3727,6 +3850,7 @@ void StorageMergeTree::clonePartsToDetached(const DataPartsVector & parts, Conte
 void StorageMergeTree::truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr query_context, TableExclusiveLockHolder &)
 {
     assertNotReadonly();
+    assertExclusiveWriter("TRUNCATE");
 
     {
         /// Asks to complete merges and does not allow them to start.
@@ -3983,6 +4107,7 @@ void StorageMergeTree::dropPartsImpl(DataPartsVector && parts_to_remove, bool de
         for (const auto & part : parts_to_remove)
             deduplication_log->dropPart(part->info);
     }
+    dropDeduplicationTokens(parts_to_remove);
 
     if (detach)
         LOG_INFO(log, "Detached {} parts: [{}]", parts_to_remove.size(), fmt::join(getPartsNames(parts_to_remove), ", "));
@@ -4976,4 +5101,112 @@ CommittingBlocksSet StorageMergeTree::getCommittingBlocks() const
     std::lock_guard lock(committing_blocks_mutex);
     return committing_blocks;
 }
+bool StorageMergeTree::isSharedWriter() const
+{
+    return inodedb_coordinator && inodedb_coordinator->shared();
+}
+
+void StorageMergeTree::assertExclusiveWriter(std::string_view operation) const
+{
+    if (isSharedWriter())
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "{} needs an exclusive writer: this server shares the disk of {} with other writers (`inodedb_writer_mode` = 'shared')",
+            operation, getStorageID().getNameForLogs());
+}
+
+std::string StorageMergeTree::getPostfixForTempInsertName() const
+{
+    return isSharedWriter() ? inodedb_coordinator->writerId() : "";
+}
+
+std::optional<Int64> StorageMergeTree::beginSharedRefresh()
+{
+    if (!isSharedWriter())
+        return std::nullopt;
+    return inodedb_coordinator->readCounter();
+}
+
+void StorageMergeTree::endSharedRefresh(Int64 complete_below)
+{
+    shared_complete_below.store(complete_below);
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(claimed_elsewhere_mutex);
+    std::erase_if(claimed_elsewhere, [now](const auto & item) { return item.second <= now; });
+}
+
+std::optional<PreformattedMessage> StorageMergeTree::sharedWriterCannotMerge(const DataPartPtr & part) const
+{
+    if (!isSharedWriter())
+        return std::nullopt;
+
+    const Int64 complete_below = shared_complete_below.load();
+    bool past_refresh_allowed = false;
+    fiu_do_on(FailPoints::inodedb_shared_merge_past_refresh, { past_refresh_allowed = true; });
+    if (part->info.max_block > complete_below && !past_refresh_allowed)
+        return PreformattedMessage::create(
+            "Part {} ends above block {}, below which this writer's last refresh saw every part", part->name, complete_below);
+
+    std::lock_guard lock(claimed_elsewhere_mutex);
+    if (auto it = claimed_elsewhere.find(part->name); it != claimed_elsewhere.end() && it->second > std::chrono::steady_clock::now())
+        return PreformattedMessage::create("Another writer holds a claim on part {}", part->name);
+    return std::nullopt;
+}
+
+bool StorageMergeTree::claimMergeSources(const FutureMergedMutatedPart & future_part)
+{
+    std::vector<String> sources;
+    sources.reserve(future_part.parts.size());
+    for (const auto & part : future_part.parts)
+        sources.push_back(part->name);
+
+    auto held = inodedb_coordinator->claim(sources, future_part.name);
+    if (held.empty())
+        return true;
+
+    LOG_INFO(log, "Another writer holds claims on {} of the sources of {}, e.g. {}", held.size(), future_part.name, held.front());
+    const auto retry_at = std::chrono::steady_clock::now() + inodedb_coordinator->coordination().claimTTL();
+    std::lock_guard lock(claimed_elsewhere_mutex);
+    for (const auto & name : held)
+        claimed_elsewhere[name] = retry_at;
+    return false;
+}
+
+void StorageMergeTree::commitSharedMergedPart(MutableDataPartPtr & part, const String & result, DataPartsLock &)
+{
+    auto & part_storage = part->getDataPartStorage();
+    /// The rename joins the transaction that holds the merged part's files, so one batch commits both.
+    part->renameTo(part->name, false);
+
+    auto claim_commits_lock = inodedb_coordinator->lockClaimCommits();
+    InodeDBCommitOptions options;
+    inodedb_coordinator->addMergeCommit(options, result);
+    auto outcome = part_storage.commitTransactionWith(options);
+    if (outcome.status != InodeDBCommitStatus::Committed)
+    {
+        part_storage.undoTransaction();
+        ProfileEvents::increment(ProfileEvents::InodeDBClaimsLost);
+        throw Exception(ErrorCodes::ABORTED, "Merge {} committed nothing: {} at {}. Claims: {}",
+            result, magic_enum::enum_name(outcome.status), fmt::join(outcome.failed_paths, ", "), inodedb_coordinator->describeClaims(result));
+    }
+    inodedb_coordinator->mergeCommitted(result, outcome.version);
+}
+
+void StorageMergeTree::dropDeduplicationTokens(const DataPartsVector & parts)
+{
+    if (!inodedb_coordinator || parts.empty())
+        return;
+    inodedb_coordinator->dropPartTokens([&](const String & part_name)
+    {
+        auto info = MergeTreePartInfo::tryParsePartName(part_name, format_version);
+        return info && std::ranges::any_of(parts, [&](const DataPartPtr & part) { return part->info.contains(*info); });
+    });
+}
+
+size_t StorageMergeTree::clearSharedWriterCoordination()
+{
+    size_t cleared = inodedb_coordinator->expireTokens();
+    cleared += inodedb_coordinator->sweepClaims(1000);
+    return cleared;
+}
+
 }
