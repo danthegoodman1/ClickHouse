@@ -44,7 +44,7 @@ private:
     /// Clips the map to the view's slice and moves it into the archive.
     ByteRangeSet toArchiveRanges(const ByteRangeSet & ranges) const;
 
-    /// Resizes working buffer if it exceeds the right bound.
+    /// Trims the working buffer to the file: from its first byte to the right bound.
     void resizeWorkingBuffer();
 
     const std::unique_ptr<ReadBufferFromFileBase> impl;

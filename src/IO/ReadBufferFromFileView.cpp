@@ -148,6 +148,15 @@ size_t ReadBufferFromFileView::getRightBound() const
 
 void ReadBufferFromFileView::resizeWorkingBuffer()
 {
+    /// BigHouse: an `impl` that holds the archive in memory, as an inline file on an `inodedb` disk does, keeps all of
+    /// it in its working buffer. Start the buffer at the file's first byte, so that `offset` and `count` measure the
+    /// file alone. `pos` lies before it only after a seek out of the file, which `seek` refuses.
+    if (file_offset_of_buffer_end >= left_bound && file_offset_of_buffer_end - left_bound < working_buffer.size())
+    {
+        Position file_begin = working_buffer.end() - (file_offset_of_buffer_end - left_bound);
+        working_buffer = Buffer(std::min(file_begin, pos), working_buffer.end());
+    }
+
     if (file_offset_of_buffer_end > getRightBound())
     {
         size_t extra_bytes = file_offset_of_buffer_end - getRightBound();

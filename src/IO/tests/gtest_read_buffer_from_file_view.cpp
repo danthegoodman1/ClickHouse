@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <IO/HashingReadBuffer.h>
 #include <IO/ReadBufferFromFileView.h>
+#include <IO/ReadBufferFromMemory.h>
+#include <IO/ReadBufferFromString.h>
 
 #include <cstring>
 
@@ -164,6 +167,32 @@ TEST(ReadBufferFromFileView, RequestMapIsShiftedIntoTheSliceAndClipped)
 
     view.setRequestMap(makeSet({{0, 10}, {90, 20}, {150, 5}}));
     expectRanges(map, {{100, 10}, {190, 10}});
+}
+
+/// BigHouse: an archive held in memory, as an inline file on an `inodedb` disk is, keeps all of itself in its working
+/// buffer. `checkDataPart` takes a file's size from `HashingReadBuffer::count`, which must count the file's bytes alone.
+TEST(ReadBufferFromFileView, MemoryArchiveCountsTheFileAlone)
+{
+    const String archive = makeArchive(1000);
+    const String file = archive.substr(100, 200);
+
+    ReadBufferFromFileView view(std::make_unique<ReadBufferFromOwnMemoryFile>("archive", archive), "file", 100, 300);
+    HashingReadBuffer hashing(view);
+    hashing.ignoreAll();
+    EXPECT_EQ(hashing.count(), file.size());
+
+    ReadBufferFromString file_buf(file);
+    HashingReadBuffer file_hashing(file_buf);
+    file_hashing.ignoreAll();
+    EXPECT_EQ(hashing.getHash(), file_hashing.getHash());
+
+    ReadBufferFromFileView reread(std::make_unique<ReadBufferFromOwnMemoryFile>("archive", archive), "file", 100, 300);
+    EXPECT_EQ(readToEnd(reread), file);
+    EXPECT_EQ(reread.count(), file.size());
+
+    EXPECT_EQ(reread.seek(50, SEEK_SET), 50);
+    EXPECT_EQ(readToEnd(reread), file.substr(50));
+    EXPECT_EQ(reread.getPosition(), 200);
 }
 
 /// The file occupies [100, 300) of the archive, and each read of the archive buffer goes past its end.
