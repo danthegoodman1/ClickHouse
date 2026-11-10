@@ -178,6 +178,7 @@ void InodeDBTableCoordinator::ensureDirectories()
 
 void InodeDBTableCoordinator::reconcileCounter(Int64 at_least)
 {
+    ensureDirectories();
     const std::string path = coordPath("block_number");
     while (true)
     {
@@ -282,6 +283,15 @@ void InodeDBTableCoordinator::addDefinitionCheck(InodeDBCommitOptions & options)
 
 void InodeDBTableCoordinator::loadTokens(size_t window_)
 {
+    /// A table without deduplication on an exclusive writer keeps nothing in InodeDB.
+    if (window_ == 0 && !shared())
+    {
+        std::lock_guard lock(mutex);
+        window = 0;
+        token_order.clear();
+        token_parts.clear();
+        return;
+    }
     ensureDirectories();
     auto files = disk->listFiles(coordPath("tokens"));
     std::ranges::sort(files, {}, [](const auto & file) { return file.second.version; });
@@ -313,6 +323,8 @@ void InodeDBTableCoordinator::loadTokens(size_t window_)
 
 void InodeDBTableCoordinator::setWindow(size_t window_)
 {
+    if (window_ > 0)
+        ensureDirectories();
     std::lock_guard lock(mutex);
     window = window_;
 }
