@@ -20,7 +20,8 @@ namespace DB
 ///   `coord/{table path}/tokens/{block id}`  a deduplication token, holding the name of the part that took it;
 ///   `coord/{table path}/claims/{part name}` a merge claim on a source part (`InodeDBMergeClaim`).
 /// Removing a directory of the disk removes its mirror under `coord/` in the same batch, so dropping a table
-/// removes its coordination files.
+/// removes its coordination files. A table that changes its path moves them (`InodeDBTableCoordinator::moveTo`), and
+/// a new table removes any at its path.
 class IInodeDBCoordination
 {
 public:

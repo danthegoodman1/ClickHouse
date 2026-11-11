@@ -1601,6 +1601,9 @@ StoredObjects MetadataStorageFromInodeDB::blobsToDelete(const pb::Freed & freed,
         return {};
     if (freed.inode().kind() != pb::FILE || !freed.has_value())
         return {};
+    /// Coordination files under `coord/` hold plain text, which never starts with the format byte, and name no blob.
+    if (freed.value().empty() || static_cast<UInt8>(freed.value()[0]) != Value::FORMAT_VERSION)
+        return {};
 
     const std::string path = fmt::format("freed inode {}", freed.handle().ino());
     Value value;

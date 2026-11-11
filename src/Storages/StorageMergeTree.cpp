@@ -260,7 +260,12 @@ StorageMergeTree::StorageMergeTree(
     /// definition version and merge claims.
     inodedb_coordinator = InodeDBTableCoordinator::create(getStoragePolicy(), relative_data_path_, log.load());
     if (mode < LoadingStrictnessLevel::ATTACH)
+    {
         assertExclusiveWriter("CREATE TABLE");
+        /// A new table owns none of the tokens a dropped table at its path may have left.
+        if (inodedb_coordinator)
+            inodedb_coordinator->removeFiles();
+    }
 
     initializeDirectoriesAndFormatVersion(relative_data_path_, LoadingStrictnessLevel::ATTACH <= mode, date_column_name);
 
@@ -561,6 +566,13 @@ void StorageMergeTree::drop()
     assertExclusiveWriter("DROP TABLE");
     shutdown(true);
     dropAllData();
+}
+
+void StorageMergeTree::rename(const String & new_table_path, const StorageID & new_table_id)
+{
+    MergeTreeData::rename(new_table_path, new_table_id);
+    if (inodedb_coordinator)
+        inodedb_coordinator->moveTo(new_table_path);
 }
 
 void StorageMergeTree::removeOwnFilesInDiskRootOnDrop(const DiskPtr & disk)
@@ -1135,9 +1147,11 @@ void StorageMergeTree::alter(
             if ((*new_storage_settings)[MergeTreeSetting::non_replicated_deduplication_window] != 0 && format_version < MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Deduplication for non-replicated MergeTree in old syntax is not supported");
 
-            deduplication_log->setDeduplicationWindowSize((*new_storage_settings)[MergeTreeSetting::non_replicated_deduplication_window]);
-        if (inodedb_coordinator)
-            inodedb_coordinator->setWindow((*new_storage_settings)[MergeTreeSetting::non_replicated_deduplication_window]);
+            /// BigHouse: on a writable `inodedb` disk, the table's coordinator keeps the tokens in place of the log.
+            if (inodedb_coordinator)
+                inodedb_coordinator->setWindow((*new_storage_settings)[MergeTreeSetting::non_replicated_deduplication_window]);
+            else
+                deduplication_log->setDeduplicationWindowSize((*new_storage_settings)[MergeTreeSetting::non_replicated_deduplication_window]);
         }
     }
 }

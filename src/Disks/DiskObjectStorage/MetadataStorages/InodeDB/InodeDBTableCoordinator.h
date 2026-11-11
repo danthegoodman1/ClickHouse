@@ -52,6 +52,11 @@ public:
     const std::string & writerId() const { return disk->writerId(); }
     IInodeDBCoordination & coordination() const { return *disk; }
 
+    /// Removes the coordination files at the table's path, so that a new table starts with none.
+    void removeFiles();
+    /// Moves the coordination files to the table's new path, as `MergeTreeData::rename` moves its directory.
+    void moveTo(const std::string & new_table_path);
+
     /// Block numbers, in shared mode.
 
     /// At startup: raises the counter to at least `at_least`, the highest block number the writer loaded.
@@ -116,6 +121,7 @@ public:
     bool mergedByThisWriter(const std::string & part_name) const;
 
 private:
+    std::string tablePath() const;
     std::string coordPath(const std::string & name) const;
     std::string tokenPath(const std::string & block_id) const;
     std::string claimPath(const std::string & part_name) const;
@@ -126,9 +132,11 @@ private:
     void removeTokens(const std::vector<std::string> & block_ids);
 
     const InodeDBCoordinationPtr disk;
-    /// The table's directory on the disk, without slashes at either end.
-    const std::string table_path;
     const LoggerPtr log;
+
+    mutable std::mutex path_mutex;
+    /// The table's directory on the disk, without slashes at either end.
+    std::string table_path;
 
     mutable std::mutex mutex;
     std::mutex claim_commits_mutex;

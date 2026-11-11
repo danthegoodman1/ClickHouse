@@ -112,6 +112,8 @@ public:
     void backupData(BackupEntriesCollector & backup_entries_collector, const String & data_path_in_backup, const std::optional<ASTs> & partitions) override;
 
     void drop() override;
+    /// BigHouse: the table's coordination files follow its directory.
+    void rename(const String & new_table_path, const StorageID & new_table_id) override;
     void truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr, TableExclusiveLockHolder &) override;
 
     void alter(const AlterCommands & commands, ContextPtr context, AlterLockHolder & table_lock_holder, DDLGuardPtr & ddl_guard) override;

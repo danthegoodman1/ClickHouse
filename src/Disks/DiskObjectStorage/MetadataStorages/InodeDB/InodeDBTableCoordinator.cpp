@@ -133,16 +133,62 @@ std::unique_ptr<InodeDBTableCoordinator> InodeDBTableCoordinator::create(const S
 
 InodeDBTableCoordinator::InodeDBTableCoordinator(InodeDBCoordinationPtr disk_, std::string table_path_, LoggerPtr log_)
     : disk(std::move(disk_))
-    , table_path(trimSlashes(std::move(table_path_)))
     , log(std::move(log_))
+    , table_path(trimSlashes(std::move(table_path_)))
 {
     if (table_path.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "A table on an `inodedb` disk has no data path to keep its coordination files under");
 }
 
+std::string InodeDBTableCoordinator::tablePath() const
+{
+    std::lock_guard lock(path_mutex);
+    return table_path;
+}
+
+void InodeDBTableCoordinator::removeFiles()
+{
+    InodeDBCommitOptions options;
+    options.ops.push_back({.kind = InodeDBCommitOptions::Kind::Remove, .path = IInodeDBCoordination::coordPath(tablePath())});
+    if (auto outcome = disk->commit(options); outcome.status != InodeDBCommitStatus::Committed)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Removing the coordination files of `{}` failed: {}", tablePath(),
+            magic_enum::enum_name(outcome.status));
+}
+
+void InodeDBTableCoordinator::moveTo(const std::string & new_table_path)
+{
+    auto to = trimSlashes(new_table_path);
+    const auto from_dir = IInodeDBCoordination::coordPath(tablePath());
+    const auto to_dir = IInodeDBCoordination::coordPath(to);
+    bool keeps_files = shared();
+    {
+        std::lock_guard lock(mutex);
+        keeps_files = keeps_files || window != 0;
+    }
+
+    /// Files a dropped table left at the new path go first. A table without deduplication keeps nothing.
+    InodeDBCommitOptions options;
+    options.ops.push_back({.kind = InodeDBCommitOptions::Kind::Remove, .path = to_dir});
+    if (keeps_files)
+    {
+        options.ops.push_back({.kind = InodeDBCommitOptions::Kind::Mkdir, .path = from_dir});
+        options.ops.push_back({.kind = InodeDBCommitOptions::Kind::Mkdir, .path = std::filesystem::path(to_dir).parent_path().string()});
+        options.ops.push_back({.kind = InodeDBCommitOptions::Kind::Rename, .path = from_dir, .to = to_dir});
+    }
+    else
+        options.ops.push_back({.kind = InodeDBCommitOptions::Kind::Remove, .path = from_dir});
+    if (auto outcome = disk->commit(options); outcome.status != InodeDBCommitStatus::Committed)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Moving the coordination files of `{}` to `{}` failed: {}", tablePath(), to,
+            magic_enum::enum_name(outcome.status));
+
+    LOG_DEBUG(log, "Moved the coordination files of `{}` to `{}`", tablePath(), to);
+    std::lock_guard lock(path_mutex);
+    table_path = std::move(to);
+}
+
 std::string InodeDBTableCoordinator::coordPath(const std::string & name) const
 {
-    return fmt::format("{}/{}", IInodeDBCoordination::coordPath(table_path), name);
+    return fmt::format("{}/{}", IInodeDBCoordination::coordPath(tablePath()), name);
 }
 
 std::string InodeDBTableCoordinator::tokenPath(const std::string & block_id) const
@@ -157,7 +203,7 @@ std::string InodeDBTableCoordinator::claimPath(const std::string & part_name) co
 
 std::string InodeDBTableCoordinator::partPath(const std::string & part_name) const
 {
-    return IInodeDBCoordination::treePath(fmt::format("{}/{}", table_path, part_name));
+    return IInodeDBCoordination::treePath(fmt::format("{}/{}", tablePath(), part_name));
 }
 
 UInt64 InodeDBTableCoordinator::nowMs()
@@ -173,7 +219,7 @@ void InodeDBTableCoordinator::ensureDirectories()
         options.ops.push_back({.kind = InodeDBCommitOptions::Kind::Mkdir, .path = coordPath("claims")});
     auto outcome = disk->commit(options);
     if (outcome.status != InodeDBCommitStatus::Committed)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Creating the coordination directories of `{}` failed", table_path);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Creating the coordination directories of `{}` failed", tablePath());
 }
 
 void InodeDBTableCoordinator::reconcileCounter(Int64 at_least)
@@ -189,7 +235,7 @@ void InodeDBTableCoordinator::reconcileCounter(Int64 at_least)
             std::lock_guard lock(mutex);
             counter = value;
             counter_version = file->version;
-            LOG_DEBUG(log, "The block number counter of `{}` is {}", table_path, value);
+            LOG_DEBUG(log, "The block number counter of `{}` is {}", tablePath(), value);
             return;
         }
 
@@ -203,7 +249,7 @@ void InodeDBTableCoordinator::reconcileCounter(Int64 at_least)
             std::lock_guard lock(mutex);
             counter = at_least;
             counter_version = outcome.version;
-            LOG_INFO(log, "Raised the block number counter of `{}` from {} to {}", table_path, value, at_least);
+            LOG_INFO(log, "Raised the block number counter of `{}` from {} to {}", tablePath(), value, at_least);
             return;
         }
         /// Another writer moved the counter meanwhile; read it again.
@@ -257,7 +303,7 @@ void InodeDBTableCoordinator::setDefinition(const std::string & sql_disk_path)
     std::lock_guard lock(mutex);
     if (!version)
     {
-        definition_error = fmt::format("the definition of the table at `{}` is not on its disk at `{}`", table_path, sql_disk_path);
+        definition_error = fmt::format("the definition of the table at `{}` is not on its disk at `{}`", tablePath(), sql_disk_path);
         return;
     }
     definition_path = IInodeDBCoordination::treePath(sql_disk_path);
@@ -277,7 +323,7 @@ void InodeDBTableCoordinator::addDefinitionCheck(InodeDBCommitOptions & options)
     if (!definition_error.empty())
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "A shared writer commits only to tables whose definitions live on the same `inodedb` disk, and {}", definition_error);
     if (definition_path.empty())
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "A shared writer commits to `{}` before it read the table's definition", table_path);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "A shared writer commits to `{}` before it read the table's definition", tablePath());
     options.when.push_back(versionIs(definition_path, definition_version, InodeDBCommitStatus::SchemaChanged));
 }
 
@@ -317,7 +363,7 @@ void InodeDBTableCoordinator::loadTokens(size_t window_)
             token_order.emplace_back(std::move(block_id), files[i].second.value);
         }
     }
-    LOG_DEBUG(log, "Loaded {} deduplication tokens of `{}`, {} beyond the window of {}", files.size(), table_path, beyond.size(), window_);
+    LOG_DEBUG(log, "Loaded {} deduplication tokens of `{}`, {} beyond the window of {}", files.size(), tablePath(), beyond.size(), window_);
     removeTokens(beyond);
 }
 
@@ -325,8 +371,21 @@ void InodeDBTableCoordinator::setWindow(size_t window_)
 {
     if (window_ > 0)
         ensureDirectories();
-    std::lock_guard lock(mutex);
-    window = window_;
+    std::vector<std::string> beyond;
+    {
+        std::lock_guard lock(mutex);
+        window = window_;
+        /// A smaller window forgets the oldest tokens at once, as `MergeTreeDeduplicationLog::setDeduplicationWindowSize` does.
+        while (token_order.size() > window)
+        {
+            token_parts.erase(token_order.front().first);
+            beyond.push_back(std::move(token_order.front().first));
+            token_order.pop_front();
+        }
+    }
+    /// A shared writer leaves its tokens to their age.
+    if (!shared())
+        removeTokens(beyond);
 }
 
 std::vector<std::string> InodeDBTableCoordinator::knownTokens(const std::vector<std::string> & block_ids) const
@@ -481,7 +540,7 @@ std::vector<std::string> InodeDBTableCoordinator::claim(const std::vector<std::s
     if (outcome.status != InodeDBCommitStatus::Committed)
     {
         /// Another writer claimed a source first, or a source is gone.
-        LOG_INFO(log, "Claiming the sources of {} in `{}` failed: {} at {}", result, table_path, magic_enum::enum_name(outcome.status),
+        LOG_INFO(log, "Claiming the sources of {} in `{}` failed: {} at {}", result, tablePath(), magic_enum::enum_name(outcome.status),
             fmt::join(outcome.failed_paths, ", "));
         std::vector<std::string> lost;
         for (const auto & path : outcome.failed_paths)
@@ -491,7 +550,7 @@ std::vector<std::string> InodeDBTableCoordinator::claim(const std::vector<std::s
 
     ProfileEvents::increment(ProfileEvents::InodeDBClaimsTaken, sources.size());
     if (taken_over)
-        LOG_INFO(log, "Took over {} expired merge claims of `{}` to merge {}", taken_over, table_path, result);
+        LOG_INFO(log, "Took over {} expired merge claims of `{}` to merge {}", taken_over, tablePath(), result);
 
     std::lock_guard lock(mutex);
     merges[result] = Merge{.sources = sources, .versions = std::vector<UInt64>(sources.size(), outcome.version)};
@@ -504,7 +563,7 @@ void InodeDBTableCoordinator::addMergeCommit(InodeDBCommitOptions & options, con
         std::lock_guard lock(mutex);
         auto it = merges.find(result);
         if (it == merges.end())
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "A shared writer commits merge {} of `{}` without claims on its sources", result, table_path);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "A shared writer commits merge {} of `{}` without claims on its sources", result, tablePath());
         const auto & merge = it->second;
         for (size_t i = 0; i < merge.sources.size(); ++i)
         {
@@ -553,12 +612,12 @@ void InodeDBTableCoordinator::endMerge(const std::string & result)
     {
         auto outcome = disk->commit(options);
         if (outcome.status != InodeDBCommitStatus::Committed)
-            LOG_INFO(log, "Another writer took over a claim of merge {} of `{}`", result, table_path);
+            LOG_INFO(log, "Another writer took over a claim of merge {} of `{}`", result, tablePath());
     }
     catch (...)
     {
         /// The claims expire.
-        tryLogCurrentException(log, fmt::format("Giving up the claims of merge {} of `{}`", result, table_path));
+        tryLogCurrentException(log, fmt::format("Giving up the claims of merge {} of `{}`", result, tablePath()));
     }
 }
 
@@ -603,7 +662,7 @@ void InodeDBTableCoordinator::renewClaims()
         }
         it->second.lost = true;
         ProfileEvents::increment(ProfileEvents::InodeDBClaimsLost);
-        LOG_WARNING(log, "Merge {} of `{}` lost its claims to another writer", result, table_path);
+        LOG_WARNING(log, "Merge {} of `{}` lost its claims to another writer", result, tablePath());
     }
 }
 
@@ -669,7 +728,7 @@ size_t InodeDBTableCoordinator::sweepClaims(size_t limit)
         if (!claim_value.done && claim_value.expiry_ms + ttl > now)
             continue;
         ++checked;
-        if (claim_value.done && disk->versionOf(fmt::format("{}/{}", table_path, part_name)))
+        if (claim_value.done && disk->versionOf(fmt::format("{}/{}", tablePath(), part_name)))
             continue;
         options.ops.push_back(atVersion(removeOp(claimPath(part_name)), file.version, InodeDBCommitStatus::ClaimLost));
     }

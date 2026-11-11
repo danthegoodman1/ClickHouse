@@ -17,6 +17,8 @@
 #include <base/scope_guard.h>
 #include <base/sleep.h>
 
+#include <fmt/ranges.h>
+
 #include <exception>
 #include <filesystem>
 #include <memory>
@@ -516,6 +518,12 @@ std::vector<std::string> MergeTreeSink::commitPartOnInodeDB(MergeTreeMutableData
     MergeTreeData::Transaction transaction(storage, context->getCurrentTransaction().get());
     auto lock = storage.lockParts();
 
+    /// An exclusive writer numbers the part before it checks the tokens, as `commitPart` does on other disks, so a
+    /// duplicate uses up a block number there too.
+    std::unique_ptr<PlainCommittingBlockHolder> block_holder;
+    if (!shared)
+        block_holder = storage.fillNewPartName(part, lock);
+
     /// An exclusive writer knows every token in its window; a shared writer learns others' from its commits.
     if (auto known = coordinator.knownTokens(block_ids); !known.empty())
     {
@@ -524,10 +532,6 @@ std::vector<std::string> MergeTreeSink::commitPartOnInodeDB(MergeTreeMutableData
         return known;
     }
     storage.throwIfTemporaryTableSizeLimitsExceededForReplacement(context, lock, {part}, std::nullopt);
-
-    std::unique_ptr<PlainCommittingBlockHolder> block_holder;
-    if (!shared)
-        block_holder = storage.fillNewPartName(part, lock);
 
     if (!in_batch)
     {
@@ -631,8 +635,13 @@ std::vector<std::string> MergeTreeSink::commitPartOnInodeDB(MergeTreeMutableData
             }
             case InodeDBCommitStatus::CounterConflict:
             {
+                /// Only another writer's part moves the counter past this number. An exclusive writer's number, a
+                /// reserved one, or a counter still below it means the part's rename failed for another reason.
+                if (!shared || reserved || coordinator.readCounter() < number)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Moving part {} of {} from `{}` to its name failed: {}",
+                        part->name, storage.getStorageID().getNameForLogs(), part_storage.getPartDirectory(),
+                        fmt::join(outcome.failed_paths, ", "));
                 ProfileEvents::increment(ProfileEvents::InodeDBCommitRetries);
-                coordinator.readCounter();
                 continue;
             }
             case InodeDBCommitStatus::DuplicateToken:
