@@ -9,7 +9,9 @@
 #include <IO/WriteHelpers.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/executeQuery.h>
+#include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTTablesInSelectQuery.h>
 #include <Parsers/IAST.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/StorageMaterializedView.h>
@@ -131,6 +133,35 @@ std::optional<std::pair<StorageID, StorageID>> viewThatReadsStoredRows(const std
     return std::nullopt;
 }
 
+/// The first table function a query names, if it names one.
+std::optional<String> tableFunctionIn(const ASTPtr & ast)
+{
+    if (!ast)
+        return std::nullopt;
+    if (const auto * expression = ast->as<ASTTableExpression>(); expression && expression->table_function)
+    {
+        const auto * function = expression->table_function->as<ASTFunction>();
+        return function ? function->name : String("(unnamed)");
+    }
+    for (const auto & child : ast->children)
+        if (auto found = tableFunctionIn(child))
+            return found;
+    return std::nullopt;
+}
+
+/// A worker registers no table function, so a view that names one fails. It fails as the view runs, after the
+/// insert's own part is committed, so the insert is refused before. Returns the first such view and function.
+std::optional<std::pair<StorageID, String>> viewThatNamesATableFunction(const std::vector<StoragePtr> & views, ContextPtr context)
+{
+    for (const auto & view : views)
+    {
+        const auto metadata = view->getInMemoryMetadataPtr(context, /* bypass_metadata_cache= */ false);
+        if (auto function = tableFunctionIn(metadata->getSelectQuery().inner_query))
+            return std::pair(view->getStorageID(), *function);
+    }
+    return std::nullopt;
+}
+
 /// The first table among those an insert writes that keeps no deduplication tokens, if any does.
 StoragePtr tableWithoutTokens(const std::vector<StoragePtr> & tables)
 {
@@ -165,6 +196,14 @@ void insert(const Engine & engine, const libch::v1::Insert & request, ReadBuffer
         response.set_message(fmt::format(
             "The view {} reads {} from the disk, besides the rows it is fed, and a worker loads no table's parts",
             reading->first.getNameForLogs(), reading->second.getNameForLogs()));
+        return;
+    }
+
+    if (auto naming = viewThatNamesATableFunction(reach.views, context))
+    {
+        response.set_status(libch::v1::REFUSED);
+        response.set_message(fmt::format(
+            "The view {} names the table function `{}`, and a worker provides no table function", naming->first.getNameForLogs(), naming->second));
         return;
     }
 

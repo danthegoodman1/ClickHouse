@@ -22,6 +22,7 @@
 #include <Common/Config/ConfigHelper.h>
 #include <Common/Exception.h>
 #include <Common/FailPoint.h>
+#include <Common/MemoryTracker.h>
 #include <Common/ThreadPool.h>
 #include <Common/logger_useful.h>
 
@@ -83,7 +84,7 @@ void registerComponents()
 }
 
 /// The server configuration of a worker: the request's settings document, then what the worker itself decides.
-Poco::AutoPtr<Poco::Util::XMLConfiguration> makeConfiguration(const libch::v1::Tenant & tenant, const std::string & settings_xml, bool selects_merges)
+Poco::AutoPtr<Poco::Util::XMLConfiguration> makeConfiguration(const libch::v1::Tenant & tenant, const std::string & settings_xml, Engine::Needs needs)
 {
     std::stringstream document; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
     document << "<clickhouse>" << settings_xml << "</clickhouse>";
@@ -113,6 +114,13 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> makeConfiguration(const libch::v1::T
     config->setString(disk + ".inodedb_key", tenant.inodedb_key());
     config->setString(disk + ".inodedb_read_only", "0");
     config->setString(disk + ".inodedb_writer_mode", "shared");
+    /// A disk removes freed blobs in rounds, one of which a transaction waits for and one of which runs at
+    /// shutdown. Only an operation that asks for the removal pays for them.
+    if (!needs.blob_removal)
+    {
+        config->setString(disk + ".data_background_cleanup.enabled", "false");
+        config->setString(disk + ".wait_for_blob_removal", "false");
+    }
     config->setString(fmt::format("storage_configuration.policies.{}.volumes.main.disk", TENANT_DISK), TENANT_DISK);
     config->setString("merge_tree.storage_policy", TENANT_DISK);
     config->setString("database_disk.disk", TENANT_DISK);
@@ -124,7 +132,7 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> makeConfiguration(const libch::v1::T
         config->setString(pool, "1");
     /// The merge selector lowers the size of the merges it proposes as the merge pool fills, so a plan keeps the
     /// pool a server has, idle.
-    if (!selects_merges)
+    if (!needs.merge_selection)
         config->setString("background_pool_size", "1");
 
     /// Queries run as a default user with a default profile, which the settings document may fill.
@@ -175,15 +183,23 @@ Engine::~Engine()
     }
 }
 
-void Engine::attachTenant(const libch::v1::Tenant & tenant, const std::string & settings_xml, bool selects_merges)
+void Engine::attachTenant(const libch::v1::Tenant & tenant, const std::string & settings_xml, Needs needs)
 {
     if (tenant_attached)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "A worker serves one tenant");
 
     /// The context reads its configuration from here on, so the configuration comes first.
-    Poco::AutoPtr<Poco::Util::XMLConfiguration> config = makeConfiguration(tenant, settings_xml, selects_merges);
+    Poco::AutoPtr<Poco::Util::XMLConfiguration> config = makeConfiguration(tenant, settings_xml, needs);
     global_context->setConfig(config);
     global_context->setApplicationType(Context::ApplicationType::LOCAL);
+
+    /// The operation's memory cap, as a server's: an allocation that would pass it throws, so an operation over
+    /// its cap fails before its commit.
+    if (const UInt64 memory_limit = config->getUInt64("max_server_memory_usage", 0))
+    {
+        total_memory_tracker.setDescription("(total)");
+        total_memory_tracker.setHardLimit(static_cast<Int64>(memory_limit));
+    }
 
     /// As a server does: the failpoints the configuration names are on from the start. Tests use them to hold a
     /// worker at a point until they kill it, and to switch a protection off.

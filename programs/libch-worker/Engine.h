@@ -28,10 +28,19 @@ public:
     explicit Engine(std::string path);
     ~Engine();
 
+    /// What an operation needs of the engine beyond the tenant's tables.
+    struct Needs
+    {
+        /// The merge pool at a server's size, which the merge selector reads to bound the merges it proposes.
+        bool merge_selection = false;
+        /// The disk's removal of freed blobs from S3. An operation without it starts and stops without waiting
+        /// for a round of removals, and what it frees waits for one that has it.
+        bool blob_removal = false;
+    };
+
     /// Configures the engine with the tenant's disk and the request's settings, joins the disk's shared writers
-    /// and attaches the tenant's databases. `selects_merges` keeps the merge pool at a server's size, which the
-    /// merge selector reads to bound the merges it proposes.
-    void attachTenant(const libch::v1::Tenant & tenant, const std::string & settings_xml, bool selects_merges);
+    /// and attaches the tenant's databases.
+    void attachTenant(const libch::v1::Tenant & tenant, const std::string & settings_xml, Needs needs);
 
     /// Releases what the worker holds in the tenant's InodeDB store, so nothing waits for it to expire.
     void detachTenant();

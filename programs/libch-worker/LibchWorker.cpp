@@ -117,7 +117,13 @@ libch::v1::Response responseOfCurrentException()
 libch::v1::Response serve(Engine & engine, const libch::v1::Request & request, ReadBuffer & in)
 {
     libch::v1::Response response;
-    engine.attachTenant(request.tenant(), request.settings_xml(), request.operation_case() == libch::v1::Request::kPlan);
+    engine.attachTenant(
+        request.tenant(),
+        request.settings_xml(),
+        Engine::Needs{
+            .merge_selection = request.operation_case() == libch::v1::Request::kPlan,
+            .blob_removal = request.operation_case() == libch::v1::Request::kHousekeep,
+        });
 
     switch (request.operation_case())
     {

@@ -323,6 +323,11 @@ void BlobKillerThread::shutdown()
 
     task->deactivate();
 
+    /// BigHouse: a disk whose cleanup is disabled removes no blobs at shutdown either. `libch-worker` disables it
+    /// for every operation but `housekeep`, so that an insert does not wait for a round of removals.
+    if (!enabled)
+        return;
+
     /// We need to execute it here explicitly because some blobs may be in the metadata storage queue.
     executeBlobsCleanup(/*max_to_remove=*/0, blobs_in_task, remove_tasks_runner, cluster, metadata_storage, object_storages, log);
 }
