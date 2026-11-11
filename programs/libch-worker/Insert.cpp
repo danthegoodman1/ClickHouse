@@ -257,9 +257,9 @@ void insert(const Engine & engine, const libch::v1::Insert & request, ReadBuffer
     context->setSetting("insert_deduplication_token", request.token());
     /// An operation commits before it answers.
     context->setSetting("async_insert", false);
-    /// A batch a caller sends to one worker is small, and one thread writes it for the least CPU. A profile in the
-    /// request's settings overrides either.
-    for (const auto * threads : {"max_threads", "max_insert_threads"})
+    /// A batch a caller sends to one worker is small, and one thread parses and writes it for the least CPU. A
+    /// profile in the request's settings overrides each.
+    for (const auto * threads : {"max_threads", "max_insert_threads", "max_parsing_threads"})
         if (!context->getSettingsRef().isChanged(threads))
             context->setSetting(threads, UInt64(1));
 

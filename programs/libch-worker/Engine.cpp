@@ -3,6 +3,8 @@
 #include <Access/AccessControl.h>
 #include <Access/MemoryAccessStorage.h>
 #include <AggregateFunctions/registerAggregateFunctions.h>
+#include <Compression/CompressionFactory.h>
+#include <DataTypes/DataTypeFactory.h>
 #include <Databases/DatabaseFactory.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
@@ -18,11 +20,13 @@
 #include <Interpreters/registerInterpreters.h>
 #include <Parsers/SecretArguments.h>
 #include <Parsers/registerParsers.h>
+#include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageMergeTree.h>
 #include <Common/AsyncLoader.h>
 #include <Common/PoolId.h>
 #include <Common/Config/ConfigHelper.h>
+#include <Common/DateLUT.h>
 #include <Common/ErrnoException.h>
 #include <Common/Exception.h>
 #include <Common/FailPoint.h>
@@ -226,6 +230,16 @@ Engine::Engine(std::string path_)
 
     /// From here on a `MergeTree` table loads no parts and starts no background work.
     StorageMergeTree::setOperationMode(true);
+
+    /// What every tenant's tables read and no tenant owns is built here, so that a waiting worker holds it before
+    /// its request arrives and a forked child inherits it: the lookup tables of the server's time zone and of UTC,
+    /// which take more than a millisecond each to fill, and the tables of types, codecs and `MergeTree` settings.
+    /// A table that names another time zone fills that zone's table in the operation that loads it.
+    UNUSED(DateLUT::serverTimezoneInstance());
+    UNUSED(DateLUT::instance("UTC"));
+    UNUSED(DataTypeFactory::instance());
+    UNUSED(CompressionCodecFactory::instance());
+    UNUSED(MergeTreeSettings{});
 }
 
 Engine::~Engine()
