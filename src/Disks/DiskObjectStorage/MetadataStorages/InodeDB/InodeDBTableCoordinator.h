@@ -52,6 +52,9 @@ public:
     const std::string & writerId() const { return disk->writerId(); }
     IInodeDBCoordination & coordination() const { return *disk; }
 
+    /// Creates `coord/{table path}/tokens` and, for a shared writer, `claims`. A writer that loads tokens or
+    /// reconciles the counter has done so; one that did neither calls this before it claims a merge's sources.
+    void ensureDirectories();
     /// Removes the coordination files at the table's path, so that a new table starts with none.
     void removeFiles();
     /// Moves the coordination files to the table's new path, as `MergeTreeData::rename` moves its directory.
@@ -124,6 +127,9 @@ public:
     /// Removes other writers' claims on parts that no longer exist, and `held` ones well past their expiry,
     /// checking at most `limit` parts.
     size_t sweepClaims(size_t limit);
+    /// The parts that merges of other writers hold now: those with a `held` claim before its expiry. A writer
+    /// that plans merges without claiming reads them, where a merging writer learns of each from a failed claim.
+    std::vector<std::string> partsHeldByOthers() const;
     /// Whether this writer merged the part away, and so removes its directory once it is old.
     bool mergedByThisWriter(const std::string & part_name) const;
 
@@ -134,8 +140,6 @@ private:
     std::string claimPath(const std::string & part_name) const;
     std::string partPath(const std::string & part_name) const;
     static UInt64 nowMs();
-    /// `coord/{table path}/tokens` and, for a shared writer, `claims`.
-    void ensureDirectories();
     void removeTokens(const std::vector<std::string> & block_ids);
 
     const InodeDBCoordinationPtr disk;

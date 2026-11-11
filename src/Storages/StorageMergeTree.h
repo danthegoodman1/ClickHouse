@@ -162,6 +162,25 @@ public:
     /// BigHouse: what a table in operation mode reads before its first commit, since it read nothing when it was
     /// attached: the version of its definition, and a block number counter above every number in the table.
     void prepareOperationCommits();
+    /// BigHouse: merges the named parts of a table in operation mode, as a shared writer merges the parts it
+    /// selected: it loads them, claims them, merges them in the calling thread and commits the result with the
+    /// claims' checks. The caller has checked the names against the table's directory: active parts, adjacent in
+    /// one partition, with no mutation pending for them. Returns the merged part's name, or nothing when another
+    /// writer holds a claim on a source.
+    std::optional<String> mergeNamedParts(const Strings & names);
+    /// BigHouse: a merge `planMerges` proposes: its source parts' names in block order, with their rows and their
+    /// bytes on disk.
+    struct PlannedMerge
+    {
+        Strings sources;
+        UInt64 rows = 0;
+        UInt64 bytes = 0;
+    };
+    /// BigHouse: the merges a shared writer's selector would start on a table in operation mode, up to
+    /// `max_merges`, each one that `mergeNamedParts` runs. It loads the table's parts as a refresh does, leaves out
+    /// the parts other writers' claims hold and the parts a mutation is pending for, and claims and merges nothing.
+    /// A table with patch parts gets no plan, since an exclusive writer applies them.
+    std::vector<PlannedMerge> planMerges(size_t max_merges);
 
 private:
     /// BigHouse: whether the table was attached in operation mode.
@@ -171,6 +190,10 @@ private:
     /// BigHouse: `prepareOperationCommits` runs once for the table.
     std::mutex operation_commits_mutex;
     bool operation_commits_prepared = false;
+    /// BigHouse: set while `planMerges` selects, so that a selection claims nothing.
+    bool planning_merges = false;
+    /// BigHouse: starts the task that renews a shared writer's merge claims.
+    void startRenewingClaims();
     /// BigHouse: tells the coordinator where the table's definition is, so that commits check its version.
     void setDefinitionForSharedCommits();
     /// BigHouse: the highest block number among the names in the table's directory, parts and mutation entries.

@@ -5,6 +5,7 @@
 #include <IO/ReadBufferFromFileDescriptor.h>
 #include <IO/WriteBufferFromFileDescriptor.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/ThreadStatus.h>
 #include <Common/logger_useful.h>
 
@@ -36,9 +37,13 @@ namespace ErrorCodes
     extern const int ABORTED;
     extern const int AUTHENTICATION_FAILED;
     extern const int BAD_ARGUMENTS;
-    extern const int NOT_IMPLEMENTED;
     extern const int SUPPORT_IS_DISABLED;
     extern const int TABLE_IS_READ_ONLY;
+}
+
+namespace FailPoints
+{
+    extern const char libch_pause_before_response[];
 }
 
 namespace LibchWorker
@@ -112,7 +117,7 @@ libch::v1::Response responseOfCurrentException()
 libch::v1::Response serve(Engine & engine, const libch::v1::Request & request, ReadBuffer & in)
 {
     libch::v1::Response response;
-    engine.attachTenant(request.tenant(), request.settings_xml());
+    engine.attachTenant(request.tenant(), request.settings_xml(), request.operation_case() == libch::v1::Request::kPlan);
 
     switch (request.operation_case())
     {
@@ -123,10 +128,15 @@ libch::v1::Response serve(Engine & engine, const libch::v1::Request & request, R
         case libch::v1::Request::kInsert:
             insert(engine, request.insert(), in, response);
             break;
-        case libch::v1::Request::kPlan:
         case libch::v1::Request::kMerge:
+            merge(engine, request.merge(), response);
+            break;
         case libch::v1::Request::kHousekeep:
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "This worker serves `describe` and `insert`");
+            housekeep(engine, request.housekeep(), response);
+            break;
+        case libch::v1::Request::kPlan:
+            plan(engine, request.plan(), response);
+            break;
         case libch::v1::Request::OPERATION_NOT_SET:
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "The request names no operation");
     }
@@ -176,6 +186,8 @@ int run(int argc, char ** argv)
     }
 
     *response.mutable_usage() = usage();
+
+    FailPointInjection::pauseFailPoint(FailPoints::libch_pause_before_response);
 
     WriteBufferFromFileDescriptor out(STDOUT_FILENO);
     writeFrame(out, response.SerializeAsString());

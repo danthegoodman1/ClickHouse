@@ -29,8 +29,9 @@ public:
     ~Engine();
 
     /// Configures the engine with the tenant's disk and the request's settings, joins the disk's shared writers
-    /// and attaches the tenant's databases.
-    void attachTenant(const libch::v1::Tenant & tenant, const std::string & settings_xml);
+    /// and attaches the tenant's databases. `selects_merges` keeps the merge pool at a server's size, which the
+    /// merge selector reads to bound the merges it proposes.
+    void attachTenant(const libch::v1::Tenant & tenant, const std::string & settings_xml, bool selects_merges);
 
     /// Releases what the worker holds in the tenant's InodeDB store, so nothing waits for it to expire.
     void detachTenant();

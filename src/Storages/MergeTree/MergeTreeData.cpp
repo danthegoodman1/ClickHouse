@@ -5242,6 +5242,38 @@ size_t MergeTreeData::clearUnusedPatchParts()
     return patch_names_to_drop.size();
 }
 
+MergeTreeData::DataPartsVector MergeTreeData::loadNamedParts(const Strings & names)
+{
+    const auto disk = getStoragePolicy()->getDisks().front();
+    DataPartsVector parts;
+    parts.reserve(names.size());
+    for (const auto & name : names)
+    {
+        const auto info = MergeTreePartInfo::fromPartName(name, format_version);
+        auto loaded = loadDataPartWithRetries(
+            info, name, disk, DataPartState::PreActive, data_parts_mutex,
+            loading_parts_initial_backoff_ms, loading_parts_max_backoff_ms, loading_parts_max_tries);
+        if (loaded.is_broken || loaded.part->getState() == DataPartState::Outdated)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "Part {} of {} is broken or was rolled back, so it cannot be loaded",
+                name, getStorageID().getNameForLogs());
+
+        /// As a refresh adds a part it listed: the part's directory has its name already.
+        if (!loaded.part->is_duplicate)
+        {
+            auto part_lock = lockParts();
+            Transaction transaction(*this, nullptr);
+            preparePartForCommit(loaded.part, transaction, part_lock, false, false);
+            transaction.commit(part_lock);
+        }
+
+        has_non_adaptive_index_granularity_parts = has_non_adaptive_index_granularity_parts || !loaded.part->index_granularity_info.mark_type.adaptive;
+        has_lightweight_delete_parts = has_lightweight_delete_parts || loaded.part->hasLightweightDelete();
+        transactions_enabled = transactions_enabled || loaded.part->wasInvolvedInTransaction();
+        parts.push_back(loaded.part);
+    }
+    return parts;
+}
+
 void MergeTreeData::rename(const String & new_table_path, const StorageID & new_table_id)
 {
     assertExclusiveWriter("RENAME");

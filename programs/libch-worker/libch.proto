@@ -87,7 +87,8 @@ message Merge {
   repeated string sources = 3;
 }
 
-// Removes what merges left behind: covered parts past the grace period, with their claims.
+// Removes what operations left behind in a table: covered parts past the grace period with their claims, tokens
+// past their age, claims of writers that are gone, and temporary directories past theirs.
 message Housekeep {
   TableName table = 1;
 }
@@ -209,6 +210,9 @@ message MergeCandidate {
   string partition_id = 1;
   // The source parts' names, in block order.
   repeated string sources = 2;
+  // The sources' rows and their bytes on disk, which size the worker that runs the merge.
+  uint64 rows = 3;
+  uint64 bytes = 4;
 }
 
 message Merged {
@@ -221,6 +225,8 @@ message Housekept {
   repeated string removed = 1;
   // The covered parts still on the disk, each with the reason it stays.
   repeated Remaining remaining = 2;
+  // How many temporary directories went: what inserts and merges whose workers died left in the table.
+  uint32 temporary_directories_removed = 3;
 }
 
 message Remaining {

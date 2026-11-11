@@ -754,6 +754,19 @@ size_t InodeDBTableCoordinator::sweepClaims(size_t limit)
     return outcome.status == InodeDBCommitStatus::Committed ? options.ops.size() : 0;
 }
 
+std::vector<std::string> InodeDBTableCoordinator::partsHeldByOthers() const
+{
+    const UInt64 now = nowMs();
+    std::vector<std::string> held;
+    for (const auto & [part_name, file] : disk->listFiles(coordPath("claims")))
+    {
+        const auto claim = ClaimValue::fromText(file.value);
+        if (!claim.done && claim.expiry_ms > now && claim.writer != writerId())
+            held.push_back(part_name);
+    }
+    return held;
+}
+
 bool InodeDBTableCoordinator::mergedByThisWriter(const std::string & part_name) const
 {
     std::lock_guard lock(mutex);

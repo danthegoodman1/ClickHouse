@@ -103,6 +103,7 @@ namespace DB
 namespace FailPoints
 {
     extern const char inodedb_shared_merge_past_refresh[];
+    extern const char libch_merge_pause_after_claims[];
     extern const char inodedb_shared_startup_cleanup[];
     extern const char storage_merge_tree_background_clear_old_parts_pause[];
     extern const char storage_merge_tree_load_mutations_pause_before_read[];
@@ -360,25 +361,8 @@ void StorageMergeTree::startup()
     /// BigHouse: a shared writer's commits require the version of the definition it loaded.
     if (isSharedWriter())
     {
-        const auto table_id = getStorageID();
         setDefinitionForSharedCommits();
-
-        if (!inodedb_claims_task)
-        {
-            inodedb_claims_task = getContext()->getSchedulePool()->createTask(table_id, "StorageMergeTree::renewClaims", [this]
-            {
-                try
-                {
-                    inodedb_coordinator->renewClaims();
-                }
-                catch (...)
-                {
-                    tryLogCurrentException(log, "Renewing merge claims");
-                }
-                inodedb_claims_task->scheduleAfter(static_cast<size_t>(inodedb_coordinator->coordination().claimTTL().count() / 3));
-            });
-        }
-        inodedb_claims_task->activateAndSchedule();
+        startRenewingClaims();
     }
 
     /// NOTE background task will also clean runtime temporary directories periodically.
@@ -2216,7 +2200,7 @@ std::expected<MergeMutateSelectedEntryPtr, SelectMergeFailure> StorageMergeTree:
 
         /// BigHouse: a shared writer claims the sources before the merge starts. A tagger that cannot be made, for lack
         /// of disk space, gives the claims up; once made, it gives them up when it finishes unless the merge committed.
-        if (isSharedWriter() && !claimMergeSources(*future_part))
+        if (isSharedWriter() && !planning_merges && !claimMergeSources(*future_part))
             return std::unexpected(SelectMergeFailure{
                 .reason = SelectMergeFailure::Reason::CANNOT_SELECT,
                 .explanation = PreformattedMessage::create("Another writer holds a claim on a source part of {}", future_part->name),
@@ -5195,6 +5179,144 @@ void StorageMergeTree::setDefinitionForSharedCommits()
         inodedb_coordinator->setDefinitionError(fmt::format("the database `{}` keeps its definitions on another disk", table_id.database_name));
 }
 
+void StorageMergeTree::startRenewingClaims()
+{
+    if (!inodedb_claims_task)
+    {
+        inodedb_claims_task = getContext()->getSchedulePool()->createTask(getStorageID(), "StorageMergeTree::renewClaims", [this]
+        {
+            try
+            {
+                inodedb_coordinator->renewClaims();
+            }
+            catch (...)
+            {
+                tryLogCurrentException(log, "Renewing merge claims");
+            }
+            inodedb_claims_task->scheduleAfter(static_cast<size_t>(inodedb_coordinator->coordination().claimTTL().count() / 3));
+        });
+    }
+    inodedb_claims_task->activateAndSchedule();
+}
+
+std::optional<String> StorageMergeTree::mergeNamedParts(const Strings & names)
+{
+    if (!in_operation_mode)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "`mergeNamedParts` serves a table in operation mode, and {} is in none", getStorageID().getNameForLogs());
+
+    prepareOperationCommits();
+    inodedb_coordinator->ensureDirectories();
+    startRenewingClaims();
+
+    const auto parts = loadNamedParts(names);
+
+    auto table_lock_holder = lockForShare(RWLockImpl::NO_QUERY, (*getSettings())[MergeTreeSetting::lock_acquire_timeout_for_background_operations]);
+    StorageMetadataPtr metadata_snapshot;
+    MergeMutateSelectedEntryPtr merge_entry;
+    {
+        std::unique_lock lock(currently_processing_in_background_mutex);
+        auto metadata_snapshot_handle = getInMemoryMetadataPtr(getContext(), false);
+        metadata_snapshot = metadata_snapshot_handle;
+
+        MergeSelectorChoice choice;
+        choice.merge_type = MergeType::Regular;
+        const time_t now = time(nullptr);
+        for (const auto & part : parts)
+            choice.range.push_back(buildPartProperties(part, metadata_snapshot, getStoragePolicy(), now));
+
+        auto constructed_part = constructFuturePart(*this, choice, {MergeTreeDataPartState::Active});
+        if (!constructed_part)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot merge the named parts of {}: {}", getStorageID().getNameForLogs(), constructed_part.error().text);
+        auto future_part = std::move(*constructed_part);
+        if ((*getSettings())[MergeTreeSetting::assign_part_uuids])
+            future_part->uuid = UUIDHelpers::generateV4();
+
+        if (!claimMergeSources(*future_part))
+            return std::nullopt;
+
+        std::unique_ptr<CurrentlyMergingPartsTagger> tagger;
+        try
+        {
+            tagger = std::make_unique<CurrentlyMergingPartsTagger>(
+                future_part, CompactionStatistics::estimateNeededDiskSpace(future_part->parts, true), *this, metadata_snapshot, false);
+        }
+        catch (...)
+        {
+            inodedb_coordinator->endMerge(future_part->name);
+            throw;
+        }
+        merge_entry = std::make_shared<MergeMutateSelectedEntry>(future_part, std::move(tagger), std::make_shared<MutationCommands>());
+    }
+
+    FailPointInjection::pauseFailPoint(FailPoints::libch_merge_pause_after_claims);
+
+    IExecutableTask::TaskResultCallback on_finish = [](bool) {};
+    auto task = std::make_shared<MergePlainMergeTreeTask>(
+        *this, metadata_snapshot, /* deduplicate= */ false, Names{}, /* cleanup= */ false, merge_entry, table_lock_holder, on_finish);
+    task->setCurrentTransaction(MergeTreeTransactionHolder{}, MergeTreeTransactionPtr{});
+    executeHere(task);
+    return merge_entry->future_part->name;
+}
+
+std::vector<StorageMergeTree::PlannedMerge> StorageMergeTree::planMerges(size_t max_merges)
+{
+    if (!in_operation_mode)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "`planMerges` serves a table in operation mode, and {} is in none", getStorageID().getNameForLogs());
+
+    /// What a shared writer knows when it selects: every part, read after the counter, and the mutation entries.
+    prepareOperationCommits();
+    refreshDataPartsOnce(0);
+    loadMutations();
+
+    if (!getPatchPartsVectorForInternalUsage().empty())
+        return {};
+
+    /// A server learns of another writer's claim when its own claim fails. A plan claims nothing, so it reads
+    /// the claims and leaves the parts they hold to their writers.
+    {
+        const auto held = inodedb_coordinator->partsHeldByOthers();
+        const auto until = std::chrono::steady_clock::now() + std::chrono::hours(1);
+        std::lock_guard lock(claimed_elsewhere_mutex);
+        for (const auto & part_name : held)
+            claimed_elsewhere[part_name] = until;
+    }
+
+    auto table_lock_holder = lockForShare(RWLockImpl::NO_QUERY, (*getSettings())[MergeTreeSetting::lock_acquire_timeout_for_background_operations]);
+    planning_merges = true;
+    SCOPE_EXIT_SAFE({ planning_merges = false; });
+
+    /// Each selection tags its parts as merging, so the next one selects among the rest.
+    std::vector<MergeMutateSelectedEntryPtr> selected;
+    std::vector<PlannedMerge> plans;
+    while (plans.size() < max_merges)
+    {
+        std::unique_lock lock(currently_processing_in_background_mutex);
+        auto metadata_snapshot_handle = getInMemoryMetadataPtr(getContext(), false);
+        StorageMetadataPtr metadata_snapshot = metadata_snapshot_handle;
+        auto selection = selectPartsToMerge(
+            metadata_snapshot, /* aggressive= */ false, /* partition_id= */ "", /* final= */ false, table_lock_holder, lock,
+            /* txn= */ nullptr, /* optimize_skip_merged_partitions= */ false, /* on_wait_for_running_merges= */ {});
+        if (!selection.has_value())
+            break;
+
+        /// A merge of one part rewrites it for a TTL, which the `merge` operation leaves to a server.
+        const auto & sources = selection.value()->future_part->parts;
+        if (sources.size() >= 2)
+        {
+            PlannedMerge planned;
+            for (const auto & part : sources)
+            {
+                planned.sources.push_back(part->name);
+                planned.rows += part->rows_count;
+                planned.bytes += part->getBytesOnDisk();
+            }
+            plans.push_back(std::move(planned));
+        }
+        selected.push_back(std::move(selection.value()));
+    }
+    return plans;
+}
+
 void StorageMergeTree::prepareOperationCommits()
 {
     std::lock_guard lock(operation_commits_mutex);
@@ -5298,6 +5420,12 @@ std::optional<PreformattedMessage> StorageMergeTree::sharedWriterCannotMerge(con
     if (part->info.max_block > complete_below && !past_refresh_allowed)
         return PreformattedMessage::create(
             "Part {} ends above block {}, below which this writer's last refresh saw every part", part->name, complete_below);
+
+    /// A plan proposes what `mergeNamedParts` runs, which reads no mutation entries, so the parts a mutation is
+    /// pending for wait for the exclusive writer that finishes it. The selector holds
+    /// `currently_processing_in_background_mutex` here.
+    if (planning_merges && current_mutations_by_version.upper_bound(part->info.getDataVersion()) != current_mutations_by_version.end())
+        return PreformattedMessage::create("A mutation is pending for part {}, and an exclusive writer finishes mutations", part->name);
 
     std::lock_guard lock(claimed_elsewhere_mutex);
     if (auto it = claimed_elsewhere.find(part->name); it != claimed_elsewhere.end() && it->second > std::chrono::steady_clock::now())

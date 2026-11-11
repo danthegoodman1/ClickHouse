@@ -13,8 +13,11 @@ set (CLICKHOUSE_LIBCH_WORKER_SOURCES
     Describe.cpp
     Engine.cpp
     Frames.cpp
+    Housekeep.cpp
     Insert.cpp
     LibchWorker.cpp
+    Merge.cpp
+    Plan.cpp
     Usage.cpp
 )
 

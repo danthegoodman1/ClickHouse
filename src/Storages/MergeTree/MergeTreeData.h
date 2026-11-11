@@ -1757,6 +1757,10 @@ private:
     mutable IndexSize primary_index_size;
 
 protected:
+    /// BigHouse: loads the named parts from the table's directory and adds them to the table as active, for a
+    /// table that loaded none at startup. Returns them in the order of `names`.
+    DataPartsVector loadNamedParts(const Strings & names);
+
     void loadPartAndFixMetadataImpl(MergeTreeData::MutableDataPartPtr part, ContextPtr local_context) const;
 
     void unregisterFromMergeSelection(const MergeTreeSettingsPtr & settings);

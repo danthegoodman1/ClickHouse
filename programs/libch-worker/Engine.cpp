@@ -19,7 +19,9 @@
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageMergeTree.h>
 #include <Common/AsyncLoader.h>
+#include <Common/Config/ConfigHelper.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/ThreadPool.h>
 #include <Common/logger_useful.h>
 
@@ -81,7 +83,7 @@ void registerComponents()
 }
 
 /// The server configuration of a worker: the request's settings document, then what the worker itself decides.
-Poco::AutoPtr<Poco::Util::XMLConfiguration> makeConfiguration(const libch::v1::Tenant & tenant, const std::string & settings_xml)
+Poco::AutoPtr<Poco::Util::XMLConfiguration> makeConfiguration(const libch::v1::Tenant & tenant, const std::string & settings_xml, bool selects_merges)
 {
     std::stringstream document; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
     document << "<clickhouse>" << settings_xml << "</clickhouse>";
@@ -117,9 +119,13 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> makeConfiguration(const libch::v1::T
 
     /// An operation runs in the thread that serves it. The engine's pools exist because its code names them, so
     /// each is as small as it goes.
-    for (const auto * pool : {"background_pool_size", "background_move_pool_size", "background_fetches_pool_size", "background_common_pool_size",
+    for (const auto * pool : {"background_move_pool_size", "background_fetches_pool_size", "background_common_pool_size",
              "background_schedule_pool_initial_size", "tables_loader_foreground_pool_size", "tables_loader_background_pool_size"})
         config->setString(pool, "1");
+    /// The merge selector lowers the size of the merges it proposes as the merge pool fills, so a plan keeps the
+    /// pool a server has, idle.
+    if (!selects_merges)
+        config->setString("background_pool_size", "1");
 
     /// Queries run as a default user with a default profile, which the settings document may fill.
     if (!config->has("profiles.default"))
@@ -169,15 +175,23 @@ Engine::~Engine()
     }
 }
 
-void Engine::attachTenant(const libch::v1::Tenant & tenant, const std::string & settings_xml)
+void Engine::attachTenant(const libch::v1::Tenant & tenant, const std::string & settings_xml, bool selects_merges)
 {
     if (tenant_attached)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "A worker serves one tenant");
 
     /// The context reads its configuration from here on, so the configuration comes first.
-    Poco::AutoPtr<Poco::Util::XMLConfiguration> config = makeConfiguration(tenant, settings_xml);
+    Poco::AutoPtr<Poco::Util::XMLConfiguration> config = makeConfiguration(tenant, settings_xml, selects_merges);
     global_context->setConfig(config);
     global_context->setApplicationType(Context::ApplicationType::LOCAL);
+
+    /// As a server does: the failpoints the configuration names are on from the start. Tests use them to hold a
+    /// worker at a point until they kill it, and to switch a protection off.
+    Poco::Util::AbstractConfiguration::Keys fail_points;
+    config->keys("fail_points_active", fail_points);
+    for (const auto & fail_point : fail_points)
+        if (ConfigHelper::getBool(*config, "fail_points_active." + fail_point))
+            FailPointInjection::enableFailPoint(fail_point);
 
     if (path.empty())
     {
