@@ -2006,6 +2006,11 @@ InodeDBCommitOutcome MetadataStorageFromInodeDBTransaction::commitWith(const Ino
     /// database from this disk. Such a transaction changes nothing, so a read-only disk commits it, as `local` does.
     if (!extra && storage.isReadOnly() && onlyCreatesExistingDirectories())
         return {};
+    /// A writer that shares the disk attaches databases an exclusive writer created: it creates directories that
+    /// exist, and removes a temporary database's directory that is absent. Neither changes anything, so the writer
+    /// sends no batch, and attaching costs it reads alone.
+    if (!extra && storage.settings.shared && changesNothing())
+        return {};
     storage.assertWritable();
 
     /// A shared writer's server changes no definitions: an exclusive writer runs DDL. Every server at startup creates
@@ -2065,6 +2070,23 @@ bool MetadataStorageFromInodeDBTransaction::onlyCreatesExistingDirectories() con
     {
         return (intent.kind == IntentKind::CreateDirectory || intent.kind == IntentKind::CreateDirectoryRecursive)
             && storage.existsDirectory(intent.path);
+    });
+}
+
+bool MetadataStorageFromInodeDBTransaction::changesNothing() const
+{
+    return std::ranges::all_of(intents, [this](const Intent & intent)
+    {
+        switch (intent.kind)
+        {
+            case IntentKind::CreateDirectory:
+            case IntentKind::CreateDirectoryRecursive:
+                return storage.existsDirectory(intent.path);
+            case IntentKind::RemoveRecursive:
+                return !storage.existsFileOrDirectory(intent.path);
+            default:
+                return false;
+        }
     });
 }
 

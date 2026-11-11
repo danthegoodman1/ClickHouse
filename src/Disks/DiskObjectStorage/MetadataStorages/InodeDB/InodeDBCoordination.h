@@ -38,6 +38,9 @@ public:
 
     /// Whether this server shares the disk with other writers (`inodedb_writer_mode` = `shared`).
     virtual bool isSharedWriter() const = 0;
+    /// The version of `owner` this writer wrote or joined: the start of its epoch. A file with a later version was
+    /// written in the epoch.
+    virtual UInt64 ownerVersion() const = 0;
     /// Random for each server start. It names the writer in claims and in its temporary directories.
     virtual const std::string & writerId() const = 0;
     /// How long a shared writer keeps a deduplication token.

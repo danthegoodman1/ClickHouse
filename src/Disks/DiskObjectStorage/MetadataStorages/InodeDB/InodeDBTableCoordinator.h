@@ -63,6 +63,10 @@ public:
     void reconcileCounter(Int64 at_least);
     /// Reads the counter from InodeDB and returns it.
     Int64 readCounter();
+    /// For a writer that loaded no parts: reads the counter, and returns whether a writer of this shared epoch wrote
+    /// it. An exclusive writer numbers its parts without the counter, so a counter from before the epoch may trail
+    /// the table's parts, and the writer raises it with `reconcileCounter` before it numbers a part.
+    bool readCounterOfThisEpoch();
     /// One above the counter as last read: the number a new part tries.
     Int64 nextBlockNumber() const;
     /// Replaces the counter with `number` under the version last read.
@@ -83,6 +87,9 @@ public:
     /// Loads the tokens and sets the window; zero turns deduplication off.
     void loadTokens(size_t window);
     void setWindow(size_t window);
+    /// Creates the directories of the table's tokens and claims in a commit's batch, for a writer that has loaded
+    /// no tokens and so may be the first to write one.
+    void addDirectories(InodeDBCommitOptions & options) const;
     /// The block ids among `block_ids` the writer knows as taken.
     std::vector<std::string> knownTokens(const std::vector<std::string> & block_ids) const;
     /// Creates a token for each block id and, for an exclusive writer, removes those that leave the window.

@@ -138,7 +138,46 @@ public:
     void assertExclusiveWriter(std::string_view operation) const override;
     std::string getPostfixForTempInsertName() const override;
 
+    /// BigHouse: operation mode, which `libch-worker` turns on for its whole process. A table attached in operation
+    /// mode serves a caller that runs single inserts and merges and schedules them itself. It loads no parts, reads
+    /// no mutation entries and no deduplication tokens, starts no background work and cleans nothing up, so
+    /// attaching it reads nothing from its disk. Its disk is an `inodedb` disk the process shares with other
+    /// writers, which numbers the table's parts and holds its tokens. A query cannot read the table, because the
+    /// table knows none of its parts.
+    static void setOperationMode(bool enabled);
+    static bool isOperationMode();
+    bool inOperationMode() const { return in_operation_mode; }
+
+    /// BigHouse: a part a table in operation mode committed, which the process reports to its caller.
+    struct OperationCommit
+    {
+        StorageID table;
+        String part_name;
+        UInt64 rows = 0;
+        UInt64 bytes = 0;
+    };
+    /// BigHouse: the parts the tables of this process committed in operation mode since the last call, in order.
+    static std::vector<OperationCommit> takeOperationCommits();
+    void recordOperationCommit(const DataPartPtr & part) const;
+    /// BigHouse: what a table in operation mode reads before its first commit, since it read nothing when it was
+    /// attached: the version of its definition, and a block number counter above every number in the table.
+    void prepareOperationCommits();
+
 private:
+    /// BigHouse: whether the table was attached in operation mode.
+    const bool in_operation_mode = isOperationMode();
+    /// BigHouse: what the constructor does in operation mode, in place of loading the table from its directory.
+    void attachInOperationMode(const String & relative_data_path_, const String & date_column_name);
+    /// BigHouse: `prepareOperationCommits` runs once for the table.
+    std::mutex operation_commits_mutex;
+    bool operation_commits_prepared = false;
+    /// BigHouse: tells the coordinator where the table's definition is, so that commits check its version.
+    void setDefinitionForSharedCommits();
+    /// BigHouse: the highest block number among the names in the table's directory, parts and mutation entries.
+    Int64 highestBlockNumberInDirectory() const;
+    /// BigHouse: throws for what needs the table's parts, which operation mode leaves unloaded.
+    void assertPartsAreLoaded(std::string_view operation) const;
+
     /// BigHouse: see `InodeDBTableCoordinator`.
     std::shared_ptr<InodeDBTableCoordinator> inodedb_coordinator;
     /// BigHouse: a shared writer merges only parts numbered up to this block, below which its last refresh saw

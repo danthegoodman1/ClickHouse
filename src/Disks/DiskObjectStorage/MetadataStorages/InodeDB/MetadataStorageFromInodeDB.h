@@ -138,6 +138,7 @@ public:
     static std::string treePath(const std::string & path) { return IInodeDBCoordination::treePath(path); }
 
     bool isSharedWriter() const override { return settings.shared; }
+    UInt64 ownerVersion() const override { return owner_version.load(); }
     const std::string & writerId() const override { return writer_id; }
     std::chrono::seconds tokenTTL() const override { return settings.token_ttl; }
     std::chrono::milliseconds claimTTL() const override { return settings.claim_ttl; }
@@ -323,6 +324,8 @@ private:
     AttemptResult attempt(bool read_state, bool & frees, const InodeDBCommitOptions * extra, InodeDBCommitOutcome & outcome);
     /// Whether every intent creates a directory that exists already, so the transaction changes nothing.
     bool onlyCreatesExistingDirectories() const;
+    /// Whether every intent creates a directory that exists or removes a path that is absent.
+    bool changesNothing() const;
 
     MetadataStorageFromInodeDB & storage;
     std::vector<Intent> intents;

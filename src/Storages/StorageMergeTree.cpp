@@ -149,6 +149,7 @@ namespace Setting
 namespace MergeTreeSetting
 {
     extern const MergeTreeSettingsBool allow_experimental_replacing_merge_with_cleanup;
+    extern const MergeTreeSettingsSeconds old_parts_lifetime;
     extern const MergeTreeSettingsMergeTreePatchPartsVersion patch_parts_version;
     extern const MergeTreeSettingsBool always_use_copy_instead_of_hardlinks;
     extern const MergeTreeSettingsBool assign_part_uuids;
@@ -220,6 +221,37 @@ static MergeTreeTransactionPtr tryGetTransactionForMutation(const MergeTreeMutat
     return {};
 }
 
+/// BigHouse: see `StorageMergeTree::setOperationMode`.
+static std::atomic<bool> operation_mode_enabled = false;
+
+void StorageMergeTree::setOperationMode(bool enabled)
+{
+    operation_mode_enabled.store(enabled);
+}
+
+bool StorageMergeTree::isOperationMode()
+{
+    return operation_mode_enabled.load();
+}
+
+/// BigHouse: see `StorageMergeTree::takeOperationCommits`.
+static std::mutex recorded_operation_commits_mutex;
+static std::vector<StorageMergeTree::OperationCommit> recorded_operation_commits;
+
+std::vector<StorageMergeTree::OperationCommit> StorageMergeTree::takeOperationCommits()
+{
+    std::lock_guard lock(recorded_operation_commits_mutex);
+    return std::exchange(recorded_operation_commits, {});
+}
+
+void StorageMergeTree::recordOperationCommit(const DataPartPtr & part) const
+{
+    if (!in_operation_mode)
+        return;
+    std::lock_guard lock(recorded_operation_commits_mutex);
+    recorded_operation_commits.push_back({.table = getStorageID(), .part_name = part->name, .rows = part->rows_count, .bytes = part->getBytesOnDisk()});
+}
+
 static bool supportTransaction(const Disks & disks, LoggerPtr log)
 {
     for (const auto & disk : disks)
@@ -267,6 +299,13 @@ StorageMergeTree::StorageMergeTree(
             inodedb_coordinator->removeFiles();
     }
 
+    /// BigHouse: in operation mode the table is ready once it knows its definition.
+    if (in_operation_mode)
+    {
+        attachInOperationMode(relative_data_path_, date_column_name);
+        return;
+    }
+
     initializeDirectoriesAndFormatVersion(relative_data_path_, LoadingStrictnessLevel::ATTACH <= mode, date_column_name);
 
     loadDataParts(LoadingStrictnessLevel::FORCE_RESTORE <= mode, std::nullopt);
@@ -300,6 +339,10 @@ void StorageMergeTree::startup()
     if (shutdown_called.load())
         return;
 
+    /// BigHouse: a table in operation mode starts no background work and cleans nothing up.
+    if (in_operation_mode)
+        return;
+
     const bool readonly = isTableReadonly();
     /// BigHouse: the temporary directories of a shared disk belong to other writers' running inserts and merges too,
     /// and empty parts to the exclusive writer; the background cleanup removes a shared writer's own.
@@ -318,11 +361,7 @@ void StorageMergeTree::startup()
     if (isSharedWriter())
     {
         const auto table_id = getStorageID();
-        auto database = DatabaseCatalog::instance().tryGetDatabase(table_id.database_name);
-        if (database && getInodeDBCoordination(database->getDisk()).get() == &inodedb_coordinator->coordination())
-            inodedb_coordinator->setDefinition(database->getObjectMetadataPath(table_id.table_name));
-        else
-            inodedb_coordinator->setDefinitionError(fmt::format("the database `{}` keeps its definitions on another disk", table_id.database_name));
+        setDefinitionForSharedCommits();
 
         if (!inodedb_claims_task)
         {
@@ -475,6 +514,8 @@ void StorageMergeTree::read(
     size_t max_block_size,
     size_t num_streams)
 {
+    assertPartsAreLoaded("A query");
+
     /// The reading step for parallel replicas is built in the Planner, so don't do it here.
     /// TODO(unique-key): support parallel reading.
     const bool enable_parallel_reading = !storage_snapshot->metadata->hasUniqueKey()
@@ -510,6 +551,10 @@ std::optional<UInt64> StorageMergeTree::totalRows(ContextPtr local_context) cons
 {
     chassert(local_context);
 
+    /// BigHouse: a table in operation mode knows no totals, so a query that asks reads the table, and is refused.
+    if (in_operation_mode)
+        return {};
+
     UInt64 res = 0;
     if (local_context->getCurrentTransaction())
     {
@@ -530,12 +575,18 @@ std::optional<UInt64> StorageMergeTree::totalRowsByPartitionPredicate(const Acti
 {
     chassert(local_context);
 
+    if (in_operation_mode)
+        return {};
+
     auto parts = getVisibleDataPartsVector(local_context);
     return totalRowsByPartitionPredicateImpl(filter_actions_dag, local_context, RangesInDataParts(parts));
 }
 
 std::optional<UInt64> StorageMergeTree::totalBytes(ContextPtr) const
 {
+    if (in_operation_mode)
+        return {};
+
     UInt64 res = 0;
     auto lock = readLockParts();
     for (const auto & part : getDataPartsStateRange(DataPartState::Active, MergeTreePartInfo::Kind::Regular))
@@ -545,6 +596,9 @@ std::optional<UInt64> StorageMergeTree::totalBytes(ContextPtr) const
 
 std::optional<UInt64> StorageMergeTree::totalBytesUncompressed(const Settings &) const
 {
+    if (in_operation_mode)
+        return {};
+
     UInt64 res = 0;
     auto lock = readLockParts();
     for (const auto & part : getDataPartsStateRange(DataPartState::Active, MergeTreePartInfo::Kind::Regular))
@@ -5115,6 +5169,91 @@ CommittingBlocksSet StorageMergeTree::getCommittingBlocks() const
     std::lock_guard lock(committing_blocks_mutex);
     return committing_blocks;
 }
+void StorageMergeTree::attachInOperationMode(const String & relative_data_path_, const String & date_column_name)
+{
+    if (!isSharedWriter())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "A process in operation mode attaches the tables of an `inodedb` disk it shares with other writers, and {} is on another disk",
+            getStorageID().getNameForLogs());
+    if (!date_column_name.empty() || relative_data_path_.empty())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "A process in operation mode attaches tables of the current `MergeTree` syntax that keep a directory of their own, and {} is another kind",
+            getStorageID().getNameForLogs());
+
+    /// A table of the current syntax has this format version, which a server reads from the table's directory.
+    relative_data_path = relative_data_path_;
+    format_version = MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING;
+}
+
+void StorageMergeTree::setDefinitionForSharedCommits()
+{
+    const auto table_id = getStorageID();
+    auto database = DatabaseCatalog::instance().tryGetDatabase(table_id.database_name);
+    if (database && getInodeDBCoordination(database->getDisk()).get() == &inodedb_coordinator->coordination())
+        inodedb_coordinator->setDefinition(database->getObjectMetadataPath(table_id.table_name));
+    else
+        inodedb_coordinator->setDefinitionError(fmt::format("the database `{}` keeps its definitions on another disk", table_id.database_name));
+}
+
+void StorageMergeTree::prepareOperationCommits()
+{
+    std::lock_guard lock(operation_commits_mutex);
+    if (operation_commits_prepared)
+        return;
+
+    /// Every change of a definition runs on an exclusive writer, whose epoch fences this process, so the version
+    /// read here is the version of the definition the table was attached from.
+    setDefinitionForSharedCommits();
+
+    /// A server raises the counter to the highest block number of the parts it loaded. This table loaded none, so
+    /// it trusts a counter written in its own epoch, which a writer raised that way or took from a commit, and
+    /// raises any older one from the names in its directory.
+    if (!inodedb_coordinator->readCounterOfThisEpoch())
+        inodedb_coordinator->reconcileCounter(highestBlockNumberInDirectory());
+
+    operation_commits_prepared = true;
+}
+
+Int64 StorageMergeTree::highestBlockNumberInDirectory() const
+{
+    static constexpr std::string_view mutation_prefix = "mutation_";
+    static constexpr std::string_view mutation_suffix = ".txt";
+
+    Stopwatch watch;
+    Int64 highest = 0;
+    for (const auto & disk : getStoragePolicy()->getDisks())
+    {
+        for (auto it = disk->iterateDirectory(relative_data_path); it->isValid(); it->next())
+        {
+            const String name = it->name();
+            if (auto info = MergeTreePartInfo::tryParsePartName(name, format_version))
+            {
+                highest = std::max({highest, info->max_block, info->mutation});
+            }
+            else if (name.starts_with(mutation_prefix) && name.ends_with(mutation_suffix))
+            {
+                Int64 version = 0;
+                if (tryParse(version, name.substr(mutation_prefix.size(), name.size() - mutation_prefix.size() - mutation_suffix.size())))
+                    highest = std::max(highest, version);
+            }
+        }
+    }
+
+    /// As a shared writer's refresh: a listing this slow may have missed a part whose covering part's sources
+    /// other writers removed while it ran.
+    if (watch.elapsedSeconds() * 2 > static_cast<double>((*getSettings())[MergeTreeSetting::old_parts_lifetime].totalSeconds()))
+        throw Exception(ErrorCodes::ABORTED, "Listing the parts of {} took {:.1f} s, more than half of `old_parts_lifetime`",
+            getStorageID().getNameForLogs(), watch.elapsedSeconds());
+    return highest;
+}
+
+void StorageMergeTree::assertPartsAreLoaded(std::string_view operation) const
+{
+    if (in_operation_mode)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "{} needs the parts of {}, and a process in operation mode loads none", operation, getStorageID().getNameForLogs());
+}
+
 bool StorageMergeTree::isSharedWriter() const
 {
     return inodedb_coordinator && inodedb_coordinator->shared();

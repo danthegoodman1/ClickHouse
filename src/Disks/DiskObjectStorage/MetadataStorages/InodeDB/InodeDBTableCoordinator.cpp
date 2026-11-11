@@ -265,6 +265,15 @@ Int64 InodeDBTableCoordinator::readCounter()
     return counter;
 }
 
+bool InodeDBTableCoordinator::readCounterOfThisEpoch()
+{
+    auto file = disk->readFile(coordPath("block_number"));
+    std::lock_guard lock(mutex);
+    counter = file ? parse<Int64>(file->value) : 0;
+    counter_version = file ? file->version : 0;
+    return file && file->version > disk->ownerVersion();
+}
+
 Int64 InodeDBTableCoordinator::nextBlockNumber() const
 {
     std::lock_guard lock(mutex);
@@ -386,6 +395,13 @@ void InodeDBTableCoordinator::setWindow(size_t window_)
     /// A shared writer leaves its tokens to their age.
     if (!shared())
         removeTokens(beyond);
+}
+
+void InodeDBTableCoordinator::addDirectories(InodeDBCommitOptions & options) const
+{
+    options.ops.push_back({.kind = InodeDBCommitOptions::Kind::Mkdir, .path = coordPath("tokens")});
+    if (shared())
+        options.ops.push_back({.kind = InodeDBCommitOptions::Kind::Mkdir, .path = coordPath("claims")});
 }
 
 std::vector<std::string> InodeDBTableCoordinator::knownTokens(const std::vector<std::string> & block_ids) const

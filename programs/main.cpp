@@ -34,6 +34,8 @@ int mainEntryClickHouseExtractFromConfig(int argc, char ** argv);
 int mainEntryClickHouseFormat(int argc, char ** argv);
 int mainEntryClickHouseFstDumpTree(int argc, char ** argv);
 int mainEntryClickHouseGitImport(int argc, char ** argv);
+/// BigHouse: the libch crate's worker.
+int mainEntryClickHouseLibchWorker(int argc, char ** argv);
 int mainEntryClickHouseLocal(int argc, char ** argv);
 int mainEntryClickHouseObfuscator(int argc, char ** argv);
 int mainEntryClickHouseOomCanary(int argc, char ** argv);
@@ -135,6 +137,8 @@ std::pair<std::string_view, MainFunc> clickhouse_applications[] =
 {
     {"local", mainEntryClickHouseLocal},
     {"client", mainEntryClickHouseClient},
+    /// BigHouse: the libch crate's worker.
+    {"libch-worker", mainEntryClickHouseLibchWorker},
 #if USE_CHDIG
     {"chdig", mainEntryClickHouseChdig},
     {"dig", mainEntryClickHouseChdig},

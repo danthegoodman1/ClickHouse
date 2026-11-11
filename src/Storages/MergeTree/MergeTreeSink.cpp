@@ -513,6 +513,10 @@ std::vector<std::string> MergeTreeSink::commitPartOnInodeDB(MergeTreeMutableData
             "A writer that shares its disk commits parts with full storage, and part {} is packed: set `min_bytes_for_full_part_storage` to 0",
             part->name);
 
+    /// A table in operation mode read nothing when it was attached, so it reads what its commits check now.
+    if (storage.inOperationMode())
+        storage.prepareOperationCommits();
+
     /// It's important to create it outside of lock scope because
     /// otherwise it can lock parts in destructor and deadlock is possible.
     MergeTreeData::Transaction transaction(storage, context->getCurrentTransaction().get());
@@ -596,6 +600,9 @@ std::vector<std::string> MergeTreeSink::commitPartOnInodeDB(MergeTreeMutableData
         /// The batch writes the part's files under its temporary directory and moves it to the part's name. After a
         /// conflict, the next batch moves it to the next number instead.
         InodeDBCommitOptions options;
+        /// A table in operation mode loaded no tokens, so the batch makes sure their directory exists.
+        if (storage.inOperationMode())
+            coordinator.addDirectories(options);
         coordinator.addPartRename(options, part_storage.getPartDirectory(), part->name);
         if (!tokens_after_part)
             coordinator.addTokens(options, block_ids, part->name);
@@ -631,6 +638,7 @@ std::vector<std::string> MergeTreeSink::commitPartOnInodeDB(MergeTreeMutableData
                 /// The part's directory has its name already, so this adds the part to the table and renames nothing.
                 storage.renameTempPartAndAdd(part, transaction, lock, /*rename_in_transaction=*/ false);
                 transaction.commit(lock);
+                storage.recordOperationCommit(part);
                 return {};
             }
             case InodeDBCommitStatus::CounterConflict:

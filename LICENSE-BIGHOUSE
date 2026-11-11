@@ -2,12 +2,14 @@ BigHouse
 
 Copyright (c) 2026 Dan Goodman. All rights reserved.
 
-This branch adds BigHouse's InodeDB metadata type to ClickHouse. No license
-is granted for BigHouse's work, which is:
+This branch adds BigHouse's InodeDB metadata type to ClickHouse, and the
+worker of libch, which serves single inserts and merges on that metadata
+type. No license is granted for BigHouse's work, which is:
 
 - every file under src/Disks/DiskObjectStorage/MetadataStorages/InodeDB/;
-- the changes that BigHouse's commits on the bighouse branch make to other
-  files.
+- every file under programs/libch-worker/;
+- the changes that BigHouse's commits on the bighouse branch, and libch's
+  commits on the libch-worker branch, make to other files.
 
 The Apache License 2.0 in LICENSE covers ClickHouse's code only, including the
 unchanged parts of files BigHouse modifies. Each ClickHouse file that BigHouse

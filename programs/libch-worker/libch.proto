@@ -1,0 +1,229 @@
+// The protocol between the libch crate and a worker.
+//
+// A worker serves one operation and exits. Both directions carry frames: a 4-byte little-endian length, then
+// that many bytes.
+//
+//   crate -> worker (stdin):   one Request frame; for an insert, the batch as data frames of raw bytes, ended
+//                              by a frame of length zero.
+//   worker -> crate (stdout):  one Response frame.
+//
+// The worker logs to stderr and exits with status zero once it has written its response. Any other exit means
+// the worker failed, and the crate takes nothing it wrote as an answer.
+syntax = "proto3";
+
+package libch.v1;
+
+message Request {
+  Tenant tenant = 1;
+  // Server settings as the XML a stock writer boots with, such as `<merge_tree>` and `<compression>`, so an
+  // operation writes parts as that writer would.
+  string settings_xml = 2;
+
+  oneof operation {
+    Describe describe = 10;
+    Insert insert = 11;
+    Plan plan = 12;
+    Merge merge = 13;
+    Housekeep housekeep = 14;
+  }
+}
+
+// One tenant's disk, and the credentials that reach it.
+message Tenant {
+  // The InodeDB store's address, as `127.0.0.1:7170`.
+  string inodedb_endpoint = 1;
+  // A key with the `write` grant, rooted at the tenant's directory.
+  string inodedb_key = 2;
+  S3 s3 = 3;
+}
+
+message S3 {
+  // The service's URL, as `http://127.0.0.1:11211`.
+  string endpoint = 1;
+  string bucket = 2;
+  // The disk's key prefix inside the bucket, without a leading or trailing slash.
+  string prefix = 3;
+  string region = 4;
+  string access_key = 5;
+  string secret_key = 6;
+}
+
+message TableName {
+  string database = 1;
+  string table = 2;
+}
+
+// Reports the tenant's catalog as the engine sees it. Writes nothing.
+message Describe {
+  // Also list each table's parts, with each name as the engine parses it.
+  bool parts = 1;
+}
+
+// Inserts one batch into a table and into every view that reads from it. The batch follows the request as
+// data frames.
+message Insert {
+  TableName table = 1;
+  // A ClickHouse input format, as `JSONEachRow`.
+  string format = 2;
+  // Names the batch. A second insert of the batch under the same token writes nothing.
+  string token = 3;
+  // Accepts a table, or a view's target, that keeps no deduplication tokens, where a second insert of the
+  // batch writes it again. Unset, the worker refuses such an insert.
+  bool at_least_once = 4;
+}
+
+// Proposes merges for a table, and runs none.
+message Plan {
+  TableName table = 1;
+  // The most merges to propose.
+  uint32 max_merges = 2;
+}
+
+// Merges source parts of one partition into one part.
+message Merge {
+  TableName table = 1;
+  string partition_id = 2;
+  // The source parts' names, in block order.
+  repeated string sources = 3;
+}
+
+// Removes what merges left behind: covered parts past the grace period, with their claims.
+message Housekeep {
+  TableName table = 1;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  // The operation did its work, and `result` holds what it produced.
+  OK = 1;
+  // An insert found every block of its batch already committed under the same token, and wrote nothing.
+  DUPLICATE = 2;
+  // A table's definition changed since the worker loaded it. Nothing was committed.
+  SCHEMA_CHANGED = 3;
+  // An exclusive writer took the disk, or the worker's key was revoked. Nothing was committed.
+  FENCED = 4;
+  // A merge lost a claim on a source part, or a source part is gone. Nothing was committed.
+  CLAIM_LOST = 5;
+  // The worker declined the operation, and `message` says why. Nothing was committed.
+  REFUSED = 6;
+  // The operation failed, and `message` says how. What it committed, if anything, is unknown.
+  FAILED = 7;
+}
+
+message Response {
+  Status status = 1;
+  // Why the operation was refused, or how it failed.
+  string message = 2;
+  // The ClickHouse exception code, when the operation failed with an exception.
+  int32 exception_code = 3;
+  // What the worker spent, whatever the status.
+  Usage usage = 4;
+
+  oneof result {
+    Described described = 10;
+    Inserted inserted = 11;
+    Planned planned = 12;
+    Merged merged = 13;
+    Housekept housekept = 14;
+  }
+}
+
+// What a worker spent from its start to its response, as the worker itself counted it.
+message Usage {
+  // Calls to the tenant's InodeDB store, by kind.
+  uint32 inodedb_commits = 1;
+  uint32 inodedb_stats = 2;
+  uint32 inodedb_reads = 3;
+  uint32 inodedb_lists = 4;
+  // Requests to S3 that read, and requests that write.
+  uint32 s3_reads = 5;
+  uint32 s3_writes = 6;
+  // The worker's CPU time, user and system, in microseconds.
+  uint64 cpu_microseconds = 7;
+  // The worker's anonymous memory, in bytes, and its threads, as it answered.
+  uint64 anonymous_memory_bytes = 8;
+  uint32 threads = 9;
+}
+
+message Described {
+  repeated Table tables = 1;
+}
+
+message Table {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    TABLE = 1;
+    MATERIALIZED_VIEW = 2;
+    VIEW = 3;
+    DICTIONARY = 4;
+  }
+
+  TableName name = 1;
+  string uuid = 2;
+  Kind kind = 3;
+  // The storage engine, as `MergeTree`. Empty for a view.
+  string engine = 4;
+  // The materialized views that read from this table, each with the table it writes to.
+  repeated View views = 5;
+  // The table's parts, when the request asked for them.
+  repeated Part parts = 6;
+}
+
+message View {
+  TableName view = 1;
+  TableName target = 2;
+}
+
+// A part's directory name, and what the engine reads from it.
+message Part {
+  string name = 1;
+  string partition_id = 2;
+  int64 min_block = 3;
+  int64 max_block = 4;
+  uint32 level = 5;
+  int64 mutation = 6;
+  // No other part of the table contains this one.
+  bool active = 7;
+}
+
+message Inserted {
+  // The parts written, for the table and for each view's target, in the order they committed.
+  repeated CommittedPart parts = 1;
+  // How many commits found their block number taken by another writer's part and went again with the next.
+  uint32 counter_conflicts = 2;
+}
+
+message CommittedPart {
+  TableName table = 1;
+  string part = 2;
+  uint64 rows = 3;
+  // The part's size on the disk.
+  uint64 bytes = 4;
+}
+
+message Planned {
+  repeated MergeCandidate candidates = 1;
+}
+
+message MergeCandidate {
+  string partition_id = 1;
+  // The source parts' names, in block order.
+  repeated string sources = 2;
+}
+
+message Merged {
+  // The name of the part that now holds the sources' rows.
+  string part = 1;
+}
+
+message Housekept {
+  // The covered parts removed.
+  repeated string removed = 1;
+  // The covered parts still on the disk, each with the reason it stays.
+  repeated Remaining remaining = 2;
+}
+
+message Remaining {
+  string part = 1;
+  string reason = 2;
+}

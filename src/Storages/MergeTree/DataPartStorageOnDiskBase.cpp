@@ -1180,6 +1180,10 @@ InodeDBCommitOutcome DataPartStorageOnDiskBase::commitTransactionWith(const Inod
 
 bool DataPartStorageOnDiskBase::isCaseInsensitive() const
 {
+    /// BigHouse: InodeDB compares names byte for byte, so a disk that keeps its metadata there answers without the
+    /// probe file `IDisk::isCaseInsensitive` writes and removes.
+    if (getDisk()->getDataSourceDescription().metadata_type == MetadataStorageType::InodeDB)
+        return false;
     return getDisk()->isCaseInsensitive();
 }
 
