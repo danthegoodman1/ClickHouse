@@ -168,7 +168,8 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> makeConfiguration(const libch::v1::T
 
 /// Lets a test resume a worker it holds at a pausing failpoint. For each pausing failpoint that is on, a thread
 /// waits until the worker reaches it, creates `{name}.paused` in `directory`, waits for `{name}.resume` to appear
-/// there, and switches the failpoint off, which lets the worker go on.
+/// there, and switches the failpoint off, which lets the worker go on. The settings name the directory with
+/// `fail_point_signals`, relative to the worker's own.
 void signalPauses(const std::string & directory)
 {
 #if defined(OS_LINUX)
@@ -264,10 +265,15 @@ void Engine::attachTenant(const libch::v1::Tenant & tenant, const std::string & 
     for (const auto & fail_point : fail_points)
         if (ConfigHelper::getBool(*config, "fail_points_active." + fail_point))
             FailPointInjection::enableFailPoint(fail_point);
-    if (const std::string signals = config->getString("fail_point_signals", ""); !signals.empty())
-        signalPauses(signals);
 
     global_context->setPath(fs::path(path) / "");
+    /// The directory a test watches for a held worker, under the worker's own, where a sandboxed worker may write.
+    if (const std::string signals = config->getString("fail_point_signals", ""); !signals.empty())
+    {
+        const auto directory = fs::path(path) / signals;
+        fs::create_directories(directory);
+        signalPauses(directory);
+    }
     global_context->setTemporaryStoragePath(fs::path(path) / "tmp" / "", 0);
     global_context->setFlagsPath(fs::path(path) / "flags" / "");
 
