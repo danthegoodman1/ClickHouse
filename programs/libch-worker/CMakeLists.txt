@@ -18,6 +18,7 @@ set (CLICKHOUSE_LIBCH_WORKER_SOURCES
     LibchWorker.cpp
     Merge.cpp
     Plan.cpp
+    Sandbox.cpp
     Usage.cpp
 )
 

@@ -17,7 +17,11 @@ namespace DB
 /// Use separate function to load system tables.
 /// If `async_load_databases = true` returns tasks for asynchronous load and startup of all tables
 /// Note that returned tasks are already scheduled.
-[[nodiscard]] LoadTaskPtrs loadMetadata(ContextMutablePtr context, const String & default_database_name = {}, bool async_load_databases = false);
+/// BigHouse: with `load_on_demand` the tasks come back unscheduled, and the caller keeps them alive. A table is
+/// then loaded and started when a query first reaches it, with the tables it depends on and the materialized views
+/// that read from it, as a query on a server that loads its databases asynchronously prioritizes them.
+[[nodiscard]] LoadTaskPtrs loadMetadata(
+    ContextMutablePtr context, const String & default_database_name = {}, bool async_load_databases = false, bool load_on_demand = false);
 
 /// Converts `system` database from Ordinary to Atomic (if needed)
 void maybeConvertSystemDatabase(ContextMutablePtr context, LoadTaskPtrs & load_system_metadata_tasks);

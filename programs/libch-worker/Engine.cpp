@@ -4,6 +4,8 @@
 #include <Access/MemoryAccessStorage.h>
 #include <AggregateFunctions/registerAggregateFunctions.h>
 #include <Databases/DatabaseFactory.h>
+#include <Disks/DiskObjectStorage/DiskObjectStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/IDisk.h>
 #include <Disks/registerDisks.h>
 #include <Formats/registerFormats.h>
@@ -19,12 +21,16 @@
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageMergeTree.h>
 #include <Common/AsyncLoader.h>
+#include <Common/PoolId.h>
 #include <Common/Config/ConfigHelper.h>
+#include <Common/ErrnoException.h>
 #include <Common/Exception.h>
 #include <Common/FailPoint.h>
 #include <Common/MemoryTracker.h>
+#include <Common/ProfileEvents.h>
 #include <Common/ThreadPool.h>
 #include <Common/logger_useful.h>
+#include <Common/typeid_cast.h>
 
 #include <Poco/AutoPtr.h>
 #include <Poco/SAX/InputSource.h>
@@ -33,9 +39,19 @@
 #include <filesystem>
 #include <sstream>
 
+#include <fcntl.h>
 #include <unistd.h>
 
+#if defined(OS_LINUX)
+#    include <sys/inotify.h>
+#endif
+
 namespace fs = std::filesystem;
+
+namespace ProfileEvents
+{
+    extern const Event InodeDBFreedClaimed;
+}
 
 namespace DB
 {
@@ -43,7 +59,9 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int CANNOT_OPEN_FILE;
     extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
 }
 
 void registerDatabaseAtomic(DatabaseFactory & factory);
@@ -148,6 +166,47 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> makeConfiguration(const libch::v1::T
     return config;
 }
 
+/// Lets a test resume a worker it holds at a pausing failpoint. For each pausing failpoint that is on, a thread
+/// waits until the worker reaches it, creates `{name}.paused` in `directory`, waits for `{name}.resume` to appear
+/// there, and switches the failpoint off, which lets the worker go on.
+void signalPauses(const std::string & directory)
+{
+#if defined(OS_LINUX)
+    for (const auto & fail_point : FailPointInjection::getFailPoints())
+    {
+        const bool pauses = fail_point.type == FailPointInjection::FailPointType::PauseableOnce
+            || fail_point.type == FailPointInjection::FailPointType::Pauseable;
+        if (!pauses || !fail_point.enabled)
+            continue;
+
+        ThreadFromGlobalPool([directory, name = fail_point.name]
+        {
+            FailPointInjection::waitForPause(name);
+
+            /// The watch starts before the worker says it paused, so the answer cannot slip in between.
+            const int watch = inotify_init1(IN_CLOEXEC);
+            if (watch < 0 || inotify_add_watch(watch, directory.c_str(), IN_CREATE | IN_MOVED_TO) < 0)
+                throw ErrnoException(ErrorCodes::CANNOT_OPEN_FILE, "Cannot watch `{}` for the resume of failpoint `{}`", directory, name);
+            const int paused = ::open((fs::path(directory) / (name + ".paused")).c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+            if (paused < 0)
+                throw ErrnoException(ErrorCodes::CANNOT_OPEN_FILE, "Cannot create the pause file of failpoint `{}` in `{}`", name, directory);
+            ::close(paused);
+
+            const fs::path resume = fs::path(directory) / (name + ".resume");
+            char events[4096];
+            while (!fs::exists(resume))
+                if (::read(watch, events, sizeof(events)) < 0 && errno != EINTR)
+                    throw ErrnoException(ErrorCodes::CANNOT_OPEN_FILE, "Cannot read the watch of `{}`", directory);
+            ::close(watch);
+
+            FailPointInjection::disableFailPoint(name);
+        }).detach();
+    }
+#else
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "`fail_point_signals` needs inotify, and `{}` names a directory on another system", directory);
+#endif
+}
+
 }
 
 Engine::Engine(std::string path_)
@@ -170,17 +229,14 @@ Engine::Engine(std::string path_)
 
 Engine::~Engine()
 {
+    /// A task cancels the jobs it still holds, which need the context.
+    tenant_tables.clear();
     if (global_context)
     {
         global_context->shutdown();
         global_context.reset();
     }
     shared_context.reset();
-    if (owns_path)
-    {
-        std::error_code ignored;
-        fs::remove_all(path, ignored);
-    }
 }
 
 void Engine::attachTenant(const libch::v1::Tenant & tenant, const std::string & settings_xml, Needs needs)
@@ -202,19 +258,15 @@ void Engine::attachTenant(const libch::v1::Tenant & tenant, const std::string & 
     }
 
     /// As a server does: the failpoints the configuration names are on from the start. Tests use them to hold a
-    /// worker at a point until they kill it, and to switch a protection off.
+    /// worker at a point until they kill it or let it go, and to switch a protection off.
     Poco::Util::AbstractConfiguration::Keys fail_points;
     config->keys("fail_points_active", fail_points);
     for (const auto & fail_point : fail_points)
         if (ConfigHelper::getBool(*config, "fail_points_active." + fail_point))
             FailPointInjection::enableFailPoint(fail_point);
+    if (const std::string signals = config->getString("fail_point_signals", ""); !signals.empty())
+        signalPauses(signals);
 
-    if (path.empty())
-    {
-        path = fs::temp_directory_path() / fmt::format("libch-worker-{}", getpid());
-        owns_path = true;
-    }
-    fs::create_directories(path);
     global_context->setPath(fs::path(path) / "");
     global_context->setTemporaryStoragePath(fs::path(path) / "tmp" / "", 0);
     global_context->setFlagsPath(fs::path(path) / "flags" / "");
@@ -235,8 +287,32 @@ void Engine::attachTenant(const libch::v1::Tenant & tenant, const std::string & 
     tenant_attached = true;
     global_context->getDisk(TENANT_DISK);
 
-    /// The databases live on the tenant's disk, and loading them attaches every table from its definition.
-    waitLoad(loadMetadata(global_context));
+    /// The databases live on the tenant's disk. Loading them reads every table's definition and makes the jobs
+    /// that build the tables, which run for the tables the operation reaches.
+    tenant_tables = loadMetadata(global_context, /* default_database_name= */ {}, /* async_load_databases= */ true, /* load_on_demand= */ true);
+}
+
+void Engine::loadEveryTable()
+{
+    waitLoad(TablesLoaderForegroundPoolId, tenant_tables);
+}
+
+bool Engine::removeFreedBlobs(size_t max_rounds)
+{
+    auto disk = global_context->getDisk(TENANT_DISK);
+    auto * object_disk = typeid_cast<DiskObjectStorage *>(disk.get());
+    if (!object_disk)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "The tenant's disk is no object storage disk");
+    disk->getMetadataStorage()->shutdown();
+
+    for (size_t round = 0; round < max_rounds; ++round)
+    {
+        const auto claimed_before = ProfileEvents::global_counters[ProfileEvents::InodeDBFreedClaimed];
+        object_disk->waitBlobsCleanup();
+        if (ProfileEvents::global_counters[ProfileEvents::InodeDBFreedClaimed] == claimed_before)
+            return false;
+    }
+    return true;
 }
 
 void Engine::detachTenant()

@@ -33,6 +33,7 @@ namespace fs = std::filesystem;
 namespace ProfileEvents
 {
     extern const Event InodeDBCommitConflicts;
+    extern const Event InodeDBFreedClaimed;
 }
 
 namespace DB
@@ -1646,6 +1647,7 @@ StoredObjects MetadataStorageFromInodeDB::pullFreedUnlocked()
     auto claim = client->claimFreed(settings.claim_batch);
     if (claim.freed().empty())
         return queued;
+    ProfileEvents::increment(ProfileEvents::InodeDBFreedClaimed, claim.freed().size());
 
     pb::AckRequest ack_now;
     ack_now.set_claim(claim.claim());

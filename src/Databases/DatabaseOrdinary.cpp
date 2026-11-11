@@ -17,6 +17,7 @@
 #include <Databases/DatabasesCommon.h>
 #include <Databases/TablesLoader.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/InodeDB/InodeDBCoordination.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromFile.h>
@@ -319,6 +320,10 @@ void DatabaseOrdinary::convertMergeTreeToReplicatedIfNeeded(ASTPtr ast, const Qu
 
     auto storage_disks = policy->getDisks();
     auto checking_disk = storage_disks.empty() ? getDisk() : storage_disks[0];
+    /// BigHouse: a shared writer of an `inodedb` disk changes no definition, so the flag waits for an exclusive
+    /// writer, and looking for it would cost a round trip to InodeDB for each `MergeTree` table.
+    if (auto coordination = getInodeDBCoordination(checking_disk); coordination && coordination->isSharedWriter())
+        return;
     if (!checking_disk->existsFile(convert_to_replicated_flag_path))
         return;
 

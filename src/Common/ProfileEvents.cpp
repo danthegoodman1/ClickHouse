@@ -1895,6 +1895,7 @@ The server successfully detected this situation and will download merged part fr
     M(InodeDBList, "Number of InodeDB `List` calls of `inodedb` disks.", ValueType::Number) \
     M(InodeDBClaimFreed, "Number of InodeDB `ClaimFreed` calls of `inodedb` disks.", ValueType::Number) \
     M(InodeDBAckFreed, "Number of InodeDB `AckFreed` calls of `inodedb` disks.", ValueType::Number) \
+    M(InodeDBFreedClaimed, "Number of freed files and values that `inodedb` disks claimed from InodeDB's free queue, with and without blobs to delete. `libch-worker` reads it to tell a round of blob removal that found the queue empty.", ValueType::Number) \
     M(InodeDBMintKey, "Number of InodeDB `MintKey` calls.", ValueType::Number) \
     M(InodeDBRetries, "Number of InodeDB call attempts retried after the server was unavailable or slow to answer.", ValueType::Number) \
     M(InodeDBMicroseconds, "Total time spent in InodeDB calls, retries included.", ValueType::Microseconds) \

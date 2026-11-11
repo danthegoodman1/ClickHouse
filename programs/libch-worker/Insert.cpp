@@ -162,6 +162,32 @@ std::optional<std::pair<StorageID, String>> viewThatNamesATableFunction(const st
     return std::nullopt;
 }
 
+/// The first function of a query that reads a dictionary, if one does: `dictGet` and its relatives.
+std::optional<String> dictionaryFunctionIn(const ASTPtr & ast)
+{
+    if (!ast)
+        return std::nullopt;
+    if (const auto * function = ast->as<ASTFunction>(); function && function->name.starts_with("dict"))
+        return function->name;
+    for (const auto & child : ast->children)
+        if (auto found = dictionaryFunctionIn(child))
+            return found;
+    return std::nullopt;
+}
+
+/// A worker loads no dictionary, so a view that reads one fails, and as with a table function it fails after
+/// the insert's own part is committed. Returns the first such view and function.
+std::optional<std::pair<StorageID, String>> viewThatReadsADictionary(const std::vector<StoragePtr> & views, ContextPtr context)
+{
+    for (const auto & view : views)
+    {
+        const auto metadata = view->getInMemoryMetadataPtr(context, /* bypass_metadata_cache= */ false);
+        if (auto function = dictionaryFunctionIn(metadata->getSelectQuery().inner_query))
+            return std::pair(view->getStorageID(), *function);
+    }
+    return std::nullopt;
+}
+
 /// The first table among those an insert writes that keeps no deduplication tokens, if any does.
 StoragePtr tableWithoutTokens(const std::vector<StoragePtr> & tables)
 {
@@ -204,6 +230,14 @@ void insert(const Engine & engine, const libch::v1::Insert & request, ReadBuffer
         response.set_status(libch::v1::REFUSED);
         response.set_message(fmt::format(
             "The view {} names the table function `{}`, and a worker provides no table function", naming->first.getNameForLogs(), naming->second));
+        return;
+    }
+
+    if (auto reading = viewThatReadsADictionary(reach.views, context))
+    {
+        response.set_status(libch::v1::REFUSED);
+        response.set_message(fmt::format(
+            "The view {} calls `{}`, which reads a dictionary, and a worker loads no dictionary", reading->first.getNameForLogs(), reading->second));
         return;
     }
 

@@ -127,6 +127,7 @@ namespace FailPoints
     extern const char mt_pause_before_register_mutation[];
     extern const char mt_alter_throw_in_durable_rollback[];
     extern const char mt_lightweight_update_pause_after_block_allocation[];
+    extern const char libch_insert_trust_counter[];
 }
 
 namespace Setting
@@ -5330,7 +5331,10 @@ void StorageMergeTree::prepareOperationCommits()
     /// A server raises the counter to the highest block number of the parts it loaded. This table loaded none, so
     /// it trusts a counter written in its own epoch, which a writer raised that way or took from a commit, and
     /// raises any older one from the names in its directory.
-    if (!inodedb_coordinator->readCounterOfThisEpoch())
+    bool counter_is_of_this_epoch = inodedb_coordinator->readCounterOfThisEpoch();
+    /// The hazard's test takes a counter of any epoch as current.
+    fiu_do_on(FailPoints::libch_insert_trust_counter, { counter_is_of_this_epoch = true; });
+    if (!counter_is_of_this_epoch)
         inodedb_coordinator->reconcileCounter(highestBlockNumberInDirectory());
 
     operation_commits_prepared = true;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Interpreters/Context.h>
+#include <Common/AsyncLoader.h>
 
 #include <libch.pb.h>
 
@@ -23,8 +24,8 @@ constexpr const char * TENANT_DISK = "bighouse";
 class Engine
 {
 public:
-    /// Registers what a tenant's tables and views use and creates the global context. `path` is a local directory
-    /// for the engine's temporary files; an empty one makes the engine create its own and remove it when it stops.
+    /// Registers what a tenant's tables and views use and creates the global context. `path` is the worker's own
+    /// directory, where the engine keeps its temporary files.
     explicit Engine(std::string path);
     ~Engine();
 
@@ -42,8 +43,21 @@ public:
     /// and attaches the tenant's databases.
     void attachTenant(const libch::v1::Tenant & tenant, const std::string & settings_xml, Needs needs);
 
+    /// Loads every table of the tenant. Without it a table is loaded when the operation first reaches it, with
+    /// the tables it depends on and the materialized views that read from it.
+    void loadEveryTable();
+
+    /// Removes from S3 the blobs of the files the tenant's disk has freed. The disk claims the tenant's freed files
+    /// from InodeDB a batch at a time, deletes their blobs and acknowledges them, and this runs such rounds until
+    /// one finds nothing to claim or `max_rounds` have run. Returns whether it stopped with rounds still finding
+    /// files. The reader lease goes first: while it lasts, InodeDB holds back what the operation itself freed.
+    bool removeFreedBlobs(size_t max_rounds);
+
     /// Releases what the worker holds in the tenant's InodeDB store, so nothing waits for it to expire.
     void detachTenant();
+
+    /// Moves the worker's own directory, before a tenant is attached: a forked child takes one of its own.
+    void setPath(std::string path_) { path = std::move(path_); }
 
     ContextMutablePtr globalContext() const { return global_context; }
 
@@ -52,11 +66,12 @@ public:
 
 private:
     std::string path;
-    bool owns_path = false;
     bool tenant_attached = false;
 
     std::optional<SharedContextHolder> shared_context;
     ContextMutablePtr global_context;
+    /// The jobs that load and start the tenant's tables, each run when something waits for its table.
+    LoadTaskPtrs tenant_tables;
 };
 
 }

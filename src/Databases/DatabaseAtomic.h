@@ -90,6 +90,8 @@ protected:
 
     void createDirectories();
     void createDirectoriesUnlocked() TSA_REQUIRES(mutex);
+    /// BigHouse: whether this object has created its directories under its current name.
+    bool directories_created TSA_GUARDED_BY(mutex) = false;
 
     void tryCreateMetadataSymlink();
 

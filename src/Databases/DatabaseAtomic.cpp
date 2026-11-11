@@ -106,6 +106,12 @@ void DatabaseAtomic::createDirectories()
 
 void DatabaseAtomic::createDirectoriesUnlocked()
 {
+    /// BigHouse: once for each name the database has. Attaching a table calls this, and on an `inodedb` disk each
+    /// call costs a round trip to InodeDB for each directory, which a database of hundreds of tables repeats for
+    /// every one of them.
+    if (directories_created)
+        return;
+
     auto db_disk = getDisk();
 
     DatabaseOnDisk::createDirectoriesUnlocked();
@@ -113,6 +119,7 @@ void DatabaseAtomic::createDirectoriesUnlocked()
     if (db_disk->isSymlinkSupported())
         db_disk->createDirectories(path_to_table_symlinks);
     tryCreateMetadataSymlink();
+    directories_created = true;
 }
 
 String DatabaseAtomic::getTableDataPath(const String & table_name) const
@@ -844,6 +851,8 @@ void DatabaseAtomic::renameDatabase(ContextPtr query_context, const String & new
         path_to_metadata_symlink = DatabaseCatalog::getMetadataDirPath(new_name);
         old_path_to_table_symlinks = path_to_table_symlinks;
         path_to_table_symlinks = DatabaseCatalog::getDataDirPath(new_name) / "";
+        /// BigHouse: the new name's directories are created when next asked for.
+        directories_created = false;
     }
 
     auto db_disk = getDisk();

@@ -46,9 +46,11 @@ static struct InitFiu
     REGULAR(inodedb_shared_merge_past_refresh) \
     REGULAR(inodedb_shared_release_claims_at_commit) \
     REGULAR(inodedb_shared_startup_cleanup) \
-    /* BigHouse: the same for `libch-worker`: a switch that removes a merge's checks of its named sources, and */ \
-    /* points where a test holds a worker until it kills it. */ \
+    /* BigHouse: the same for `libch-worker`: switches that remove a merge's checks of its named sources and an */ \
+    /* insert's check of the block counter's epoch, and points where a test holds a worker until it kills it or */ \
+    /* lets it go. */ \
     REGULAR(libch_merge_unchecked_sources) \
+    REGULAR(libch_insert_trust_counter) \
     PAUSEABLE_ONCE(libch_merge_pause_after_claims) \
     PAUSEABLE_ONCE(libch_housekeep_pause_between_batches) \
     PAUSEABLE_ONCE(libch_pause_before_response) \

@@ -205,7 +205,7 @@ static void dropRestoringDatabasesForTableDropping(ContextMutablePtr context, co
     }
 }
 
-LoadTaskPtrs loadMetadata(ContextMutablePtr context, const String & default_database_name, bool async_load_databases)
+LoadTaskPtrs loadMetadata(ContextMutablePtr context, const String & default_database_name, bool async_load_databases, bool load_on_demand)
 {
     auto component_guard = Coordination::setCurrentComponent("loadMetadata");
     auto default_db_disk = Context::getGlobalContextInstance()->getDatabaseDisk();
@@ -313,6 +313,11 @@ LoadTaskPtrs loadMetadata(ContextMutablePtr context, const String & default_data
     TablesLoader loader{context, std::move(loaded_databases), mode};
     auto load_tasks = loader.loadTablesAsync();
     auto startup_tasks = loader.startupTablesAsync();
+
+    /// BigHouse: `libch-worker` serves one operation, which reaches a few of its tenant's tables. Waiting for a
+    /// table schedules its jobs and the jobs they depend on, so nothing is scheduled here.
+    if (load_on_demand)
+        return joinTasks(load_tasks, startup_tasks);
 
     if (async_load_databases)
     {

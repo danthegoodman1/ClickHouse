@@ -6,6 +6,7 @@
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
+#include <Core/ServerSettings.h>
 #include <Core/Settings.h>
 #include <Core/SettingsFields.h>
 #include <Core/UUID.h>
@@ -48,6 +49,7 @@
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/ThreadPool.h>
+#include <Common/getNumberOfCPUCoresToUse.h>
 
 
 namespace fs = std::filesystem;
@@ -61,6 +63,11 @@ namespace CurrentMetrics
 
 namespace DB
 {
+namespace ServerSetting
+{
+    extern const ServerSettingsUInt64 tables_loader_foreground_pool_size;
+}
+
 namespace Setting
 {
     extern const SettingsBool force_remove_data_recursively_on_drop;
@@ -894,7 +901,12 @@ void DatabaseOnDisk::iterateMetadataFiles(const IteratingFunction & process_meta
     }
 
     /// Read and parse metadata in parallel
-    ThreadPool pool(CurrentMetrics::DatabaseOnDiskThreads, CurrentMetrics::DatabaseOnDiskThreadsActive, CurrentMetrics::DatabaseOnDiskThreadsScheduled);
+    /// BigHouse: on as many threads as the tables loader's foreground pool has, which is every core unless the
+    /// configuration says otherwise. `libch-worker` sets one thread.
+    size_t max_threads = getContext()->getServerSettings()[ServerSetting::tables_loader_foreground_pool_size];
+    if (max_threads == 0)
+        max_threads = getNumberOfCPUCoresToUse();
+    ThreadPool pool(CurrentMetrics::DatabaseOnDiskThreads, CurrentMetrics::DatabaseOnDiskThreadsActive, CurrentMetrics::DatabaseOnDiskThreadsScheduled, max_threads);
     const auto batch_size = metadata_files.size() / pool.getMaxThreads() + 1;
     for (auto it = metadata_files.begin(); it < metadata_files.end(); std::advance(it, batch_size))
     {

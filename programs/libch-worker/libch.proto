@@ -227,6 +227,12 @@ message Housekept {
   repeated Remaining remaining = 2;
   // How many temporary directories went: what inserts and merges whose workers died left in the table.
   uint32 temporary_directories_removed = 3;
+  // How many blobs the worker deleted from S3: those of files the tenant's disk had freed, in this operation or
+  // before it, that no older reader's lease still holds.
+  uint64 blobs_removed = 4;
+  // Whether the worker stopped removing blobs with freed files still coming: another housekeeping takes up the
+  // rest. Files freed while an older reader holds its lease are out of the worker's reach and do not count.
+  bool blobs_remain = 5;
 }
 
 message Remaining {
