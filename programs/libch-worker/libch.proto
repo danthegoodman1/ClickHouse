@@ -25,6 +25,7 @@ message Request {
     Plan plan = 12;
     Merge merge = 13;
     Housekeep housekeep = 14;
+    Share share = 15;
   }
 }
 
@@ -93,6 +94,12 @@ message Housekeep {
   TableName table = 1;
 }
 
+// Hands the tenant's disk to shared writers: replaces an exclusive writer's `owner` with a shared one, which
+// fences that writer. The caller sends it once the exclusive writer is done. Every other operation leaves an
+// exclusive owner in place and ends `FENCED`. On a disk that is shared already it writes nothing.
+message Share {
+}
+
 enum Status {
   STATUS_UNSPECIFIED = 0;
   // The operation did its work, and `result` holds what it produced.
@@ -101,7 +108,8 @@ enum Status {
   DUPLICATE = 2;
   // A table's definition changed since the worker loaded it. Nothing was committed.
   SCHEMA_CHANGED = 3;
-  // An exclusive writer took the disk, or the worker's key was revoked. Nothing was committed.
+  // An exclusive writer owns the disk or took it during the operation, or the worker's key was revoked.
+  // Nothing was committed. After an exclusive writer, `Share` lets operations run again.
   FENCED = 4;
   // A merge lost a claim on a source part, or a source part is gone. Nothing was committed.
   CLAIM_LOST = 5;
@@ -126,6 +134,7 @@ message Response {
     Planned planned = 12;
     Merged merged = 13;
     Housekept housekept = 14;
+    Shared shared = 15;
   }
 }
 
@@ -238,4 +247,10 @@ message Housekept {
 message Remaining {
   string part = 1;
   string reason = 2;
+}
+
+message Shared {
+  // The version of the disk's `owner`, which every shared writer's commit requires. It changes when `Share`
+  // replaces an exclusive owner and stays when the disk was shared already.
+  uint64 owner_version = 1;
 }

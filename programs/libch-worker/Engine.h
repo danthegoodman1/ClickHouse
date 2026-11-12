@@ -37,11 +37,18 @@ public:
         /// The disk's removal of freed blobs from S3. An operation without it starts and stops without waiting
         /// for a round of removals, and what it frees waits for one that has it.
         bool blob_removal = false;
+        /// The disk for shared writers whoever owns it now: the worker replaces an exclusive writer's `owner`,
+        /// which fences that writer. An operation without it leaves an exclusive owner in place and fails.
+        bool shared_owner = false;
     };
 
     /// Configures the engine with the tenant's disk and the request's settings, joins the disk's shared writers
-    /// and attaches the tenant's databases.
+    /// and attaches the tenant's databases. Throws on a disk an exclusive writer owns, unless `needs` says to
+    /// replace its owner.
     void attachTenant(const libch::v1::Tenant & tenant, const std::string & settings_xml, Needs needs);
+
+    /// The version of the disk's `owner` the worker joined or wrote.
+    UInt64 ownerVersion() const;
 
     /// Loads every table of the tenant. Without it a table is loaded when the operation first reaches it, with
     /// the tables it depends on and the materialized views that read from it.

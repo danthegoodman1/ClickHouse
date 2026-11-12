@@ -8,6 +8,7 @@
 #include <Databases/DatabaseFactory.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/InodeDB/InodeDBCoordination.h>
 #include <Disks/IDisk.h>
 #include <Disks/registerDisks.h>
 #include <Formats/registerFormats.h>
@@ -136,6 +137,9 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> makeConfiguration(const libch::v1::T
     config->setString(disk + ".inodedb_key", tenant.inodedb_key());
     config->setString(disk + ".inodedb_read_only", "0");
     config->setString(disk + ".inodedb_writer_mode", "shared");
+    /// An exclusive writer may be at work on the tenant's DDL or mutation, and an operation that replaced its
+    /// owner would fence it. Only `Share` replaces one: its caller says the exclusive writer is done.
+    config->setString(disk + ".inodedb_replace_exclusive_owner", needs.shared_owner ? "1" : "0");
     /// A disk removes freed blobs in rounds, one of which a transaction waits for and one of which runs at
     /// shutdown. Only an operation that asks for the removal pays for them.
     if (!needs.blob_removal)
@@ -303,13 +307,22 @@ void Engine::attachTenant(const libch::v1::Tenant & tenant, const std::string & 
     /// Projections are built in the temporary database.
     DatabaseCatalog::instance().initializeAndLoadTemporaryDatabase();
 
-    /// Creating the disk joins its shared writers, which fences an exclusive writer, and takes the reader lease.
+    /// Creating the disk joins its shared writers and takes the reader lease. It throws on an exclusive writer's
+    /// owner, which only `Needs::shared_owner` replaces.
     tenant_attached = true;
     global_context->getDisk(TENANT_DISK);
 
     /// The databases live on the tenant's disk. Loading them reads every table's definition and makes the jobs
     /// that build the tables, which run for the tables the operation reaches.
     tenant_tables = loadMetadata(global_context, /* default_database_name= */ {}, /* async_load_databases= */ true, /* load_on_demand= */ true);
+}
+
+UInt64 Engine::ownerVersion() const
+{
+    auto coordination = getInodeDBCoordination(global_context->getDisk(TENANT_DISK));
+    if (!coordination)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "The tenant's disk is no `inodedb` disk");
+    return coordination->ownerVersion();
 }
 
 void Engine::loadEveryTable()

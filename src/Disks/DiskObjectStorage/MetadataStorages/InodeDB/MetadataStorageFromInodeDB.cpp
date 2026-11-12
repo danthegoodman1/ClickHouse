@@ -1029,6 +1029,13 @@ void MetadataStorageFromInodeDB::joinSharedOwner()
             return;
         }
 
+        /// The exclusive writer may be at work, and only its operator knows when it is done.
+        if (owner && !settings.replace_exclusive_owner)
+            throw Exception(ErrorCodes::TABLE_IS_READ_ONLY,
+                "{} belongs to an exclusive writer (`owner` is `{}` at version {}), and this writer leaves an exclusive owner in place "
+                "(`inodedb_replace_exclusive_owner` = 0)",
+                description, owner->value, owner->version);
+
         /// Replacing an exclusive owner, or none, under the version read fences the exclusive writer, and of
         /// shared writers starting at once only the first replaces it; the others join on their next read.
         pb::CommitRequest request;

@@ -43,6 +43,9 @@ struct InodeDBMetadataSettings
     size_t cache_bytes = 256 << 20;
     /// `inodedb_writer_mode` = `shared`: the writer joins other shared writers instead of fencing them.
     bool shared = false;
+    /// `inodedb_replace_exclusive_owner` = 0: a shared writer that finds an exclusive writer's `owner` leaves it in
+    /// place and throws at startup, so it never fences an exclusive writer at work.
+    bool replace_exclusive_owner = true;
     /// How long a shared writer keeps a deduplication token.
     std::chrono::seconds token_ttl{3600};
     /// How long a merge claim lasts unless its holder renews it.
@@ -61,7 +64,8 @@ class InodeDBReaderLease;
 ///
 /// An exclusive writer (`inodedb_writer_mode` = `exclusive`) writes `owner` at startup, which fences every other
 /// writer. A shared writer joins the shared owner it finds, or replaces an exclusive one, so shared writers commit
-/// side by side until an exclusive writer starts.
+/// side by side until an exclusive writer starts. A shared writer with `inodedb_replace_exclusive_owner` = 0 joins
+/// a shared owner alone: an exclusive one stays, and the writer throws at startup.
 ///
 /// A file's value is an `InodeDB::Value`. Directories, renames and hardlinks are InodeDB's own, so a rename is
 /// one entry change and a hardlink shares the inode. Each transaction commits as one all-or-nothing batch.
@@ -186,7 +190,8 @@ private:
     void removeUnappliedBlobs(const std::vector<std::string> & keys) const noexcept;
 
     void assertWritable() const;
-    /// Joins the shared owner, or replaces an exclusive one under its version.
+    /// Joins the shared owner, or replaces an exclusive one under its version. Throws on an exclusive owner that
+    /// the settings tell it to leave in place.
     void joinSharedOwner();
 
     /// Claims released free-queue entries and queues their blobs. Returns the blobs it queued.

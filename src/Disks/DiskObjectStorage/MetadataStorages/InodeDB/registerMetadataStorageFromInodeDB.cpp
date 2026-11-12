@@ -79,6 +79,9 @@ void registerMetadataStorageFromInodeDB(MetadataStorageFactory & factory)
         settings.shared = mode == "shared";
         if (settings.shared && settings.read_only)
             throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "A read-only `inodedb` disk takes no `inodedb_writer_mode`");
+        settings.replace_exclusive_owner = config.getBool(config_prefix + ".inodedb_replace_exclusive_owner", true);
+        if (!settings.replace_exclusive_owner && !settings.shared)
+            throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "`inodedb_replace_exclusive_owner` applies to a shared writer (`inodedb_writer_mode` = 'shared')");
         settings.token_ttl = std::chrono::seconds(config.getUInt64(config_prefix + ".inodedb_deduplication_token_ttl_seconds", settings.token_ttl.count()));
         settings.claim_ttl = std::chrono::milliseconds(config.getUInt64(config_prefix + ".inodedb_claim_ttl_ms", settings.claim_ttl.count()));
         if (settings.spill_threshold == 0 || settings.spill_threshold > 48 * 1024)

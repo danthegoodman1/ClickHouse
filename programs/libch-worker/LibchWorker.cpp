@@ -263,7 +263,10 @@ void logToStderr(const std::string & level)
 /// act on has a status of its own; everything else is a failure.
 libch::v1::Status statusOfCurrentException(int code, const std::string & message)
 {
-    if (code == ErrorCodes::AUTHENTICATION_FAILED || (code == ErrorCodes::TABLE_IS_READ_ONLY && message.contains("lost ownership")))
+    if (code == ErrorCodes::AUTHENTICATION_FAILED)
+        return libch::v1::FENCED;
+    /// An exclusive writer took the disk during the operation, or owned it when the worker came to join.
+    if (code == ErrorCodes::TABLE_IS_READ_ONLY && (message.contains("lost ownership") || message.contains("belongs to an exclusive writer")))
         return libch::v1::FENCED;
     if (code == ErrorCodes::ABORTED && message.contains("definition of"))
         return libch::v1::SCHEMA_CHANGED;
@@ -295,6 +298,7 @@ libch::v1::Response serve(Engine & engine, const libch::v1::Request & request, R
         Engine::Needs{
             .merge_selection = request.operation_case() == libch::v1::Request::kPlan,
             .blob_removal = request.operation_case() == libch::v1::Request::kHousekeep,
+            .shared_owner = request.operation_case() == libch::v1::Request::kShare,
         });
 
     switch (request.operation_case())
@@ -315,6 +319,11 @@ libch::v1::Response serve(Engine & engine, const libch::v1::Request & request, R
             break;
         case libch::v1::Request::kPlan:
             plan(engine, request.plan(), response);
+            break;
+        case libch::v1::Request::kShare:
+            /// Attaching the tenant replaced an exclusive owner or joined a shared one.
+            response.mutable_shared()->set_owner_version(engine.ownerVersion());
+            response.set_status(libch::v1::OK);
             break;
         case libch::v1::Request::OPERATION_NOT_SET:
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "The request names no operation");
