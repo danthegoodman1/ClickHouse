@@ -55,6 +55,11 @@ size_t MetadataStorageFromCacheObjectStorage::getInlineFileMaxBytes() const
     return underlying->getInlineFileMaxBytes();
 }
 
+size_t MetadataStorageFromCacheObjectStorage::getInlineTransactionMaxBytes(size_t operations) const
+{
+    return underlying->getInlineTransactionMaxBytes(operations);
+}
+
 bool MetadataStorageFromCacheObjectStorage::appliesOperationsEagerly() const
 {
     return underlying->appliesOperationsEagerly();

@@ -5,10 +5,13 @@
 #include <Disks/DiskObjectStorage/Replication/ObjectStorageRouter.h>
 #include <Disks/DiskObjectStorage/Replication/ClusterConfiguration.h>
 #include <Disks/IDiskTransaction.h>
+#include <IO/WriteSettings.h>
 
 #include <Common/ThreadPool_fwd.h>
 
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace DB
 {
@@ -37,6 +40,22 @@ protected:
     MetadataTransactionPtr metadata_transaction;
     std::vector<std::function<void(MetadataTransactionPtr tx)>> operations_to_execute;
     std::unordered_map<Location, StoredObjects> written_blobs;
+    /// BigHouse: a file written inline, which the commit can still write to a blob instead.
+    struct InlineWrite
+    {
+        /// The operation that writes the file, in `operations_to_execute`.
+        size_t operation;
+        StoredObject object;
+        Locations locations;
+        WriteSettings write_settings;
+        std::shared_ptr<const std::string> data;
+    };
+    std::vector<InlineWrite> inline_writes;
+
+    /// Queues the inline write of `data` to `object.local_path`.
+    void addInlineWrite(StoredObject object, Locations locations, const WriteSettings & write_settings, std::string data);
+    /// Writes the largest inline files to blobs until the inline bytes fit `IMetadataStorage::getInlineTransactionMaxBytes`.
+    void spillInlineWrites();
 
     /// Execute the operation right away if the metadata storage applies operations eagerly,
     /// otherwise queue it until commit.

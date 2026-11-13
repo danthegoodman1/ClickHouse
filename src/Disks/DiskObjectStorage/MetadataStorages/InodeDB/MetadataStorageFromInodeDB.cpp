@@ -43,6 +43,7 @@ namespace FailPoints
 {
     extern const char inodedb_list_in_pages[];
     extern const char inodedb_list_pause_between_pages[];
+    extern const char inodedb_claim_freed_pause[];
 }
 
 namespace ErrorCodes
@@ -1648,46 +1649,51 @@ StoredObjects MetadataStorageFromInodeDB::blobsToDelete(const pb::Freed & freed,
     UNREACHABLE();
 }
 
-StoredObjects MetadataStorageFromInodeDB::pullFreedUnlocked()
+StoredObjects MetadataStorageFromInodeDB::pullFreed(size_t & claimed)
 {
     StoredObjects queued;
+    FailPointInjection::pauseFailPoint(FailPoints::inodedb_claim_freed_pause);
     auto claim = client->claimFreed(settings.claim_batch);
+    claimed = claim.freed().size();
     if (claim.freed().empty())
         return queued;
     ProfileEvents::increment(ProfileEvents::InodeDBFreedClaimed, claim.freed().size());
 
     pb::AckRequest ack_now;
     ack_now.set_claim(claim.claim());
-    for (const auto & freed : claim.freed())
     {
-        std::string id = fmt::format("{}/{}/{}", freed.version(), freed.handle().ino(), freed.has_value_version() ? freed.value_version() : 0);
-        if (auto it = freed_entries.find(id); it != freed_entries.end())
+        std::lock_guard lock(removal_mutex);
+        for (const auto & freed : claim.freed())
         {
-            /// The claim ran out before the blobs went, and InodeDB handed the entry out again.
-            it->second.claim = claim.claim();
-            it->second.freed = freed;
-            continue;
-        }
+            std::string id = fmt::format("{}/{}/{}", freed.version(), freed.handle().ino(), freed.has_value_version() ? freed.value_version() : 0);
+            if (auto it = freed_entries.find(id); it != freed_entries.end())
+            {
+                /// The claim ran out before the blobs went, and InodeDB handed the entry out again.
+                it->second.claim = claim.claim();
+                it->second.freed = freed;
+                continue;
+            }
 
-        StoredObjects last;
-        StoredObjects blobs = blobsToDelete(freed, last);
-        if (blobs.empty())
-            std::swap(blobs, last);
-        if (blobs.empty())
-        {
-            *ack_now.add_freed() = freed;
-            continue;
-        }
+            StoredObjects last;
+            StoredObjects blobs = blobsToDelete(freed, last);
+            if (blobs.empty())
+                std::swap(blobs, last);
+            if (blobs.empty())
+            {
+                *ack_now.add_freed() = freed;
+                continue;
+            }
 
-        FreedEntry entry{.claim = claim.claim(), .freed = freed, .remaining = {}, .last = std::move(last)};
-        for (const auto & blob : blobs)
-        {
-            entry.remaining.insert(blob.remote_path);
-            entries_of_blob[blob.remote_path].push_back(id);
+            FreedEntry entry{.claim = claim.claim(), .freed = freed, .remaining = {}, .last = std::move(last)};
+            for (const auto & blob : blobs)
+            {
+                entry.remaining.insert(blob.remote_path);
+                entries_of_blob[blob.remote_path].push_back(id);
+            }
+            blobs_to_remove.submitForRemoval(blobs);
+            queued.insert(queued.end(), blobs.begin(), blobs.end());
+            freed_entries.emplace(std::move(id), std::move(entry));
         }
-        blobs_to_remove.submitForRemoval(blobs);
-        queued.insert(queued.end(), blobs.begin(), blobs.end());
-        freed_entries.emplace(std::move(id), std::move(entry));
     }
 
     if (!ack_now.freed().empty())
@@ -1695,21 +1701,18 @@ StoredObjects MetadataStorageFromInodeDB::pullFreedUnlocked()
     return queued;
 }
 
-StoredObjects MetadataStorageFromInodeDB::pullFreed()
-{
-    std::lock_guard lock(removal_mutex);
-    return pullFreedUnlocked();
-}
-
 IMetadataStorage::BlobsToRemove MetadataStorageFromInodeDB::getBlobsToRemove(const ClusterConfigurationPtr & cluster, int64_t max_count)
 {
     if (settings.read_only)
         return {};
 
-    std::lock_guard lock(removal_mutex);
-    if (max_count <= 0 || std::ssize(blobs_to_remove) < max_count)
-        pullFreedUnlocked();
+    /// A claim holds at most `claim_batch` entries, so claim until the queue holds `max_count` blobs or a claim
+    /// comes back empty.
+    size_t claimed = 1;
+    while (claimed > 0 && (max_count <= 0 || getDeadBlobsQueueEstimate() < max_count))
+        pullFreed(claimed);
 
+    std::lock_guard lock(removal_mutex);
     BlobsToRemove result;
     for (const auto & blob : blobs_to_remove.takeFirst(max_count))
         result[blob] = {cluster->getLocalLocation()};
@@ -2064,7 +2067,8 @@ InodeDBCommitOutcome MetadataStorageFromInodeDBTransaction::commitWith(const Ino
     /// The commit stands either way: a failure here leaves them to the next pass.
     try
     {
-        submitted_for_removal = storage.pullFreed();
+        size_t claimed = 0;
+        submitted_for_removal = storage.pullFreed(claimed);
     }
     catch (...)
     {

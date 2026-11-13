@@ -5,11 +5,13 @@
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 #include <Common/Stopwatch.h>
-#include <Common/thread_local_rng.h>
+#include <Common/randomSeed.h>
 #include <base/scope_guard.h>
 #include <base/sleep.h>
 
 #include <cstring>
+
+#include <pcg_random.hpp>
 
 #include <grpcpp/create_channel.h>
 #include <grpcpp/security/credentials.h>
@@ -35,6 +37,7 @@ namespace ErrorCodes
 {
     extern const int ACCESS_DENIED;
     extern const int AUTHENTICATION_FAILED;
+    extern const int LIMIT_EXCEEDED;
     extern const int LOGICAL_ERROR;
     extern const int NETWORK_ERROR;
 }
@@ -79,8 +82,9 @@ bool isRetryable(const grpc::Status & status)
             code = ErrorCodes::ACCESS_DENIED;
             break;
         case grpc::StatusCode::INVALID_ARGUMENT:
-            /// The disk built a request the server can't read.
-            code = ErrorCodes::LOGICAL_ERROR;
+            /// A batch past InodeDB's limits, such as a part of more files than one commit holds, or a request the
+            /// server can't read.
+            code = inodedb_error == "too-large" || inodedb_error == "too-many-ops" ? ErrorCodes::LIMIT_EXCEEDED : ErrorCodes::LOGICAL_ERROR;
             break;
         default:
             break;
@@ -92,10 +96,13 @@ bool isRetryable(const grpc::Status & status)
 
 std::string newRequestId()
 {
+    /// A generator of its own: InodeDB answers a request id it remembers with that request's outcome, and a test
+    /// may seed `thread_local_rng`.
+    thread_local pcg64 rng(randomSeed());
     std::string id(16, '\0');
     for (size_t i = 0; i < id.size(); i += sizeof(UInt64))
     {
-        UInt64 random = thread_local_rng();
+        UInt64 random = rng();
         memcpy(id.data() + i, &random, sizeof(random));
     }
     return id;
