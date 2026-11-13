@@ -71,6 +71,7 @@ void registerMetadataStorageFromInodeDB(MetadataStorageFactory & factory)
         settings.read_only = config.getBool(config_prefix + ".inodedb_read_only", false) || object_storage->isReadOnly();
         settings.spill_threshold = config.getUInt64(config_prefix + ".inodedb_spill_threshold", settings.spill_threshold);
         settings.inline_file_max_bytes = config.getUInt64(config_prefix + ".inodedb_inline_file_max_bytes", settings.inline_file_max_bytes);
+        settings.commit_max_bytes = config.getUInt64(config_prefix + ".inodedb_commit_max_bytes", settings.commit_max_bytes);
         settings.lease_lag = std::chrono::milliseconds(config.getUInt64(config_prefix + ".inodedb_lease_lag_ms", settings.lease_lag.count()));
         settings.cache_bytes = config.getUInt64(config_prefix + ".inodedb_cache_bytes", settings.cache_bytes);
         const auto mode = config.getString(config_prefix + ".inodedb_writer_mode", "exclusive");
@@ -85,6 +86,8 @@ void registerMetadataStorageFromInodeDB(MetadataStorageFactory & factory)
             throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "`inodedb_spill_threshold` must be between 1 and 49152 bytes, since an InodeDB value holds 64 KiB");
         if (settings.inline_file_max_bytes >= settings.spill_threshold)
             throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "`inodedb_inline_file_max_bytes` must be smaller than `inodedb_spill_threshold`");
+        if (settings.commit_max_bytes >= 8 * 1024 * 1024)
+            throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "`inodedb_commit_max_bytes` must be smaller than 8 MiB, the most one InodeDB commit holds");
 
         auto key_compatibility_prefix = config.getString(config_prefix + ".key_compatibility_prefix", object_storage->getCommonKeyPrefix());
 

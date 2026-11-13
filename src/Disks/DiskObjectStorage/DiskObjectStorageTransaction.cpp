@@ -27,7 +27,9 @@
 #include <Common/threadPoolCallbackRunner.h>
 #include <base/defines.h>
 
+#include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <ranges>
 #include <vector>
@@ -100,6 +102,85 @@ MultipleDisksObjectStorageTransaction::MultipleDisksObjectStorageTransaction(
     , source_metadata_storage(std::move(source_metadata_storage_))
     , source_object_storages(std::move(source_object_storages_))
 {
+}
+
+void DiskObjectStorageTransaction::addInlineWrite(StoredObject object, Locations locations, const WriteSettings & write_settings, std::string data)
+{
+    auto shared_data = std::make_shared<const std::string>(std::move(data));
+    addOperation([path = object.local_path, shared_data](MetadataTransactionPtr tx)
+    {
+        tx->writeInlineDataToFile(path, *shared_data);
+    });
+
+    if (!metadata_storage->appliesOperationsEagerly())
+        inline_writes.push_back({
+            .operation = operations_to_execute.size() - 1,
+            .object = std::move(object),
+            .locations = std::move(locations),
+            .write_settings = write_settings,
+            .data = std::move(shared_data)});
+}
+
+void DiskObjectStorageTransaction::spillInlineWrites()
+{
+    size_t inline_bytes = 0;
+    for (const auto & write : inline_writes)
+        inline_bytes += write.data->size();
+
+    const size_t max_bytes = metadata_storage->getInlineTransactionMaxBytes(operations_to_execute.size());
+    if (inline_bytes <= max_bytes)
+        return;
+
+    /// The largest files first: the fewest blobs that bring the inline bytes within the limit.
+    std::vector<InlineWrite *> by_size;
+    by_size.reserve(inline_writes.size());
+    for (auto & write : inline_writes)
+        by_size.push_back(&write);
+    std::ranges::sort(by_size, std::ranges::greater{}, [](const InlineWrite * write) { return write->data->size(); });
+
+    std::vector<InlineWrite *> spilled;
+    for (auto * write : by_size)
+    {
+        if (inline_bytes <= max_bytes)
+            break;
+        inline_bytes -= write->data->size();
+        spilled.push_back(write);
+    }
+
+    LOG_DEBUG(getLogger("DiskObjectStorageTransaction"),
+        "Writing {} of {} inline files to blobs: a commit of {} operations holds at most {} inline bytes",
+        spilled.size(), inline_writes.size(), operations_to_execute.size(), max_bytes);
+
+    {
+        ThreadPoolCallbackRunnerLocal<void> runner(*copy_object_pool, ThreadName::DISK_OBJECT_STORAGE_WRITE_BLOB);
+        for (auto * write : spilled)
+        {
+            write->object.bytes_size = write->data->size();
+            for (const auto & location : write->locations)
+            {
+                /// Recorded first, so `undo` removes a blob whose write fails midway.
+                written_blobs[location].push_back(write->object);
+                runner.enqueueAndKeepTrack([this, write, location]
+                {
+                    auto buffer = object_storages->takePointingTo(location)->writeObject(
+                        write->object, WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, write->write_settings);
+                    buffer->write(write->data->data(), write->data->size());
+                    buffer->finalize();
+                });
+            }
+        }
+        runner.waitForAllToFinishAndRethrowFirstError();
+    }
+
+    for (const auto * write : spilled)
+    {
+        operations_to_execute[write->operation] = [object = write->object, missing_locations = cluster->findComplement(write->locations)](MetadataTransactionPtr tx)
+        {
+            tx->recordBlobsReplication(object, missing_locations);
+            tx->createMetadataFile(object.local_path, {object});
+        };
+    }
+    inline_writes.clear();
 }
 
 void DiskObjectStorageTransaction::addOperation(std::function<void(MetadataTransactionPtr tx)> op)
@@ -353,15 +434,13 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
     /// ...
     /// buf1->finalize() // shouldn't do anything with metadata operations, just memorize what to do
     /// tx->commit()
-    auto create_metadata_callback = [disk_tx = shared_from_this(), path, replicated_locations = enabled_locations, mode, object, autocommit, create_blob_if_empty](FinalizeResult result) mutable
+    auto create_metadata_callback = [disk_tx = shared_from_this(), path, replicated_locations = enabled_locations, mode, object, autocommit, create_blob_if_empty, write_settings = settings](FinalizeResult result) mutable
     {
         if (auto * inline_data = std::get_if<InlineData>(&result))
         {
-            /// Inline content lives in the metadata itself: no blob, nothing to replicate.
-            disk_tx->addOperation([path, data = std::move(inline_data->data)](MetadataTransactionPtr tx)
-            {
-                tx->writeInlineDataToFile(path, data);
-            });
+            /// Inline content lives in the metadata itself: no blob, nothing to replicate. BigHouse: unless the
+            /// commit writes it to a blob (`spillInlineWrites`).
+            disk_tx->addInlineWrite(object, replicated_locations, write_settings, std::move(inline_data->data));
 
             if (autocommit)
                 disk_tx->commit();
@@ -632,6 +711,16 @@ void DiskObjectStorageTransaction::commit()
 {
     auto component_guard = Coordination::setCurrentComponent("DiskObjectStorageTransaction::commit");
     chassert(operations_to_execute.empty() || !metadata_storage->appliesOperationsEagerly());
+    try
+    {
+        spillInlineWrites();
+    }
+    catch (...)
+    {
+        undo();
+        throw;
+    }
+
     for (size_t i = 0; i < operations_to_execute.size(); ++i)
     {
         try
@@ -669,6 +758,7 @@ void DiskObjectStorageTransaction::commit()
         waitBlobRemoval(metadata_transaction->getSubmittedForRemovalBlobs());
 
     operations_to_execute.clear();
+    inline_writes.clear();
     written_blobs.clear();
     LOG_TEST(getLogger("DiskObjectStorageTransaction"), "Transaction committed successfully");
 }
@@ -676,6 +766,17 @@ void DiskObjectStorageTransaction::commit()
 TransactionCommitOutcomeVariant DiskObjectStorageTransaction::tryCommit(const TransactionCommitOptionsVariant & options)
 {
     chassert(operations_to_execute.empty() || !metadata_storage->appliesOperationsEagerly());
+    try
+    {
+        spillInlineWrites();
+    }
+    catch (...)
+    {
+        if (needRollbackBlobs(options))
+            undo();
+        throw;
+    }
+
     for (size_t i = 0; i < operations_to_execute.size(); ++i)
     {
         try
@@ -744,6 +845,7 @@ TransactionCommitOutcomeVariant DiskObjectStorageTransaction::tryCommit(const Tr
         waitBlobRemoval(metadata_transaction->getSubmittedForRemovalBlobs());
 
     operations_to_execute.clear();
+    inline_writes.clear();
     written_blobs.clear();
     LOG_TEST(getLogger("DiskObjectStorageTransaction"), "Transaction committed successfully");
 
@@ -765,6 +867,7 @@ void DiskObjectStorageTransaction::undo() noexcept
     }
 
     operations_to_execute.clear();
+    inline_writes.clear();
     written_blobs.clear();
 }
 

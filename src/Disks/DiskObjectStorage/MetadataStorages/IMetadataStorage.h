@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -197,6 +198,10 @@ public:
 
     /// BigHouse: the largest file that `DiskObjectStorage` writes inline when the write settings ask for less.
     virtual size_t getInlineFileMaxBytes() const { return 0; }
+
+    /// BigHouse: the most inline bytes one `DiskObjectStorage` transaction of `operations` operations commits. At
+    /// commit, the transaction writes its largest inline files past them to blobs.
+    virtual size_t getInlineTransactionMaxBytes(size_t /*operations*/) const { return std::numeric_limits<size_t>::max(); }
 
     /// Returns true if underlying blob ids generator uses random.
     virtual bool areBlobPathsRandom() const = 0;

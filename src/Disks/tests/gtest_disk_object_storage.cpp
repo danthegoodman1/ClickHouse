@@ -27,6 +27,15 @@
 
 #include <gtest/gtest.h>
 
+#include "config.h"
+
+#if USE_GRPC
+#include <Disks/DiskObjectStorage/MetadataStorages/InodeDB/InodeDBClient.h>
+#include <Common/getRandomASCIIString.h>
+#include <Common/randomSeed.h>
+#endif
+
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -1199,6 +1208,83 @@ try
     auto buf = pipeline.build();
     std::string via_pipeline = readAll(*buf);
     EXPECT_EQ(via_pipeline, file_content);
+}
+catch (...)
+{
+    FAIL() << DB::getCurrentExceptionMessage(true);
+}
+#endif
+
+#if USE_GRPC
+/// BigHouse: a transaction whose files and inline bytes pass what one InodeDB commit holds writes its largest inline
+/// files to blobs. Needs an InodeDB server: `INODEDB_TEST_ENDPOINT` and an admin key in `INODEDB_TEST_KEY`.
+TEST_F(DiskObjectStorageTest, InodeDBCommitWritesInlineFilesPastItsLimitToBlobs)
+try
+{
+    const char * endpoint = std::getenv("INODEDB_TEST_ENDPOINT"); // NOLINT(concurrency-mt-unsafe)
+    const char * admin_key = std::getenv("INODEDB_TEST_KEY"); // NOLINT(concurrency-mt-unsafe)
+    if (!endpoint || !admin_key)
+        GTEST_SKIP() << "Set INODEDB_TEST_ENDPOINT and INODEDB_TEST_KEY to run the inodedb cases";
+
+    DB::InodeDB::Client admin({.endpoint = endpoint, .key = admin_key});
+    /// A generator of its own: `SetUp` seeds `thread_local_rng`, and InodeDB keeps the roots of earlier runs.
+    static pcg64 rng(randomSeed());
+    const std::string root = "gtest/" + DB::getRandomASCIIString(16, rng);
+    DB::InodeDB::pb::CommitRequest mkdir;
+    auto * op = mkdir.add_ops()->mutable_mkdir();
+    op->set_path(root);
+    op->set_parents(true);
+    admin.commit(mkdir);
+    DB::InodeDB::pb::MintKeyRequest mint;
+    mint.set_root(root);
+    mint.set_grant(DB::InodeDB::pb::WRITE);
+    const std::string key = admin.mintKey(mint).key();
+
+    const std::string config_file = "./inodedb_disk_config_for_test.xml";
+    {
+        DB::WriteBufferFromFile wb(config_file);
+        DB::writeText(fmt::format(R"(<clickhouse><storage_configuration><disks><inodedb_disk>
+            <type>object_storage</type>
+            <object_storage_type>local_blob_storage</object_storage_type>
+            <path>inodedb_blob_storage_dir/</path>
+            <metadata_type>inodedb</metadata_type>
+            <inodedb_endpoint>{}</inodedb_endpoint>
+            <inodedb_key>{}</inodedb_key>
+        </inodedb_disk></disks></storage_configuration></clickhouse>)", endpoint, key), wb);
+        wb.finalize();
+    }
+    DB::ConfigProcessor config_processor(config_file, true, true);
+    auto config = config_processor.loadConfig(false);
+    DB::DisksMap disks;
+    auto disk = DB::DiskFactory::instance().create(
+        "inodedb_disk", *config.configuration, "storage_configuration.disks.inodedb_disk", getContext().context, disks,
+        /*attach*/ false, /*custom_disk*/ false, /*skip_types*/ {});
+
+    /// 600 files of 15,000 bytes, each small enough to inline, hold 9 MB together: more than one InodeDB commit takes.
+    const size_t files = 600;
+    auto content = [](size_t i) { return std::string(15'000, static_cast<char>('a' + i % 26)) + std::to_string(i); };
+    auto tx = disk->createTransaction();
+    tx->createDirectory("part");
+    for (size_t i = 0; i < files; ++i)
+    {
+        auto wb = tx->writeFile(fmt::format("part/file_{}", i), DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteMode::Rewrite, DB::WriteSettings{});
+        DB::writeString(content(i), *wb);
+        wb->finalize();
+    }
+    tx->commit();
+
+    for (size_t i = 0; i < files; ++i)
+        EXPECT_EQ(readAll(*disk->readFile(fmt::format("part/file_{}", i), {})), content(i));
+
+    /// Some files went to blobs, and the rest stayed inline.
+    DB::RelativePathsWithMetadata blobs;
+    disk->getObjectStorage()->listObjects(fs::path(disk->getObjectStorage()->getCommonKeyPrefix()) / "", blobs, /*max_keys=*/ 0);
+    EXPECT_GT(blobs.size(), 0);
+    EXPECT_LT(blobs.size(), files);
+
+    disk->shutdown();
+    fs::remove_all("./inodedb_blob_storage_dir");
+    fs::remove(config_file);
 }
 catch (...)
 {

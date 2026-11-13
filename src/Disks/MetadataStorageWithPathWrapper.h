@@ -196,6 +196,10 @@ public:
 
     bool supportsInlineData() const override { return delegate->supportsInlineData(); }
 
+    /// BigHouse: delegates like `supportsInlineData`.
+    size_t getInlineFileMaxBytes() const override { return delegate->getInlineFileMaxBytes(); }
+    size_t getInlineTransactionMaxBytes(size_t operations) const override { return delegate->getInlineTransactionMaxBytes(operations); }
+
     bool appliesOperationsEagerly() const override { return delegate->appliesOperationsEagerly(); }
 
     bool areBlobPathsRandom() const override

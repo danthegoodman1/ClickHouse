@@ -2,8 +2,10 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <Core/ServerUUID.h>
 #include <Disks/DiskLocal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/Local/MetadataStorageFromDisk.h>
@@ -16,7 +18,9 @@
 #include <Common/ObjectStorageKey.h>
 #include <Common/ThreadStatus.h>
 #include <Common/getRandomASCIIString.h>
+#include <Common/randomSeed.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Interpreters/Context.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteBufferFromFile.h>
@@ -29,6 +33,11 @@ namespace fs = std::filesystem;
 namespace DB::ErrorCodes
 {
 extern const int TABLE_IS_READ_ONLY;
+}
+
+namespace DB::FailPoints
+{
+extern const char inodedb_claim_freed_pause[];
 }
 
 /// BigHouse: every case runs against `local` metadata and against `inodedb` metadata, which must match it.
@@ -114,7 +123,10 @@ private:
 
             /// Each storage gets a key rooted at a directory of its own.
             DB::InodeDB::Client admin({.endpoint = endpoint, .key = getenv("INODEDB_TEST_KEY")});
-            const std::string root = "gtest/" + DB::getRandomASCIIString(16);
+            /// A generator of its own: `DiskObjectStorageTest` seeds `thread_local_rng`, and InodeDB keeps the roots of
+            /// earlier runs.
+            static pcg64 rng(randomSeed());
+            const std::string root = "gtest/" + DB::getRandomASCIIString(16, rng);
             inodedb_roots[path] = root;
             DB::InodeDB::pb::CommitRequest mkdir;
             auto * op = mkdir.add_ops()->mutable_mkdir();
@@ -1732,4 +1744,53 @@ TEST_P(MetadataDiskTest, TestSpilledRecord)
     auto second_phase = drainBlobsToRemove(metadata);
     ASSERT_EQ(second_phase.size(), 1);
     EXPECT_TRUE(getObjectStorage("/TestSpilledRecord")->exists(DB::StoredObject(*second_phase.begin())));
+}
+
+TEST_P(MetadataDiskTest, TestBlobsOfManyRemovedFiles)
+{
+    /// More removed files than InodeDB hands out in one claim (60): one `getBlobsToRemove` returns every blob.
+    auto metadata = getMetadataStorage("/TestBlobsOfManyRemovedFiles");
+    constexpr size_t files = 200;
+    std::set<std::string> blobs;
+
+    {
+        auto tx = metadata->createTransaction();
+        tx->createDirectory("A");
+        for (size_t i = 0; i < files; ++i)
+        {
+            const std::string name = "file-" + std::to_string(i);
+            const std::string key = "key-" + std::to_string(i);
+            tx->createMetadataFile("A/" + name, {DB::StoredObject(key, name, 1)});
+            blobs.insert(key);
+        }
+        tx->commit(DB::NoCommitOptions{});
+        verifyBlobsToRemove(metadata, {});
+    }
+
+    {
+        auto tx = metadata->createTransaction();
+        for (size_t i = 0; i < files; ++i)
+            tx->unlinkFile("A/file-" + std::to_string(i), /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->commit(DB::NoCommitOptions{});
+        verifyBlobsToRemove(metadata, blobs);
+    }
+}
+
+TEST_P(MetadataDiskTest, TestRemovalQueueReadableDuringClaim)
+{
+    if (GetParam() != "inodedb")
+        GTEST_SKIP() << "`local` metadata claims nothing from a server";
+
+    /// While a claim waits for InodeDB, the removal queue stays readable: a commit that frees files and the blob
+    /// killer go on.
+    auto metadata = getMetadataStorage("/TestRemovalQueueReadableDuringClaim");
+    DB::FailPointInjection::enableFailPoint(DB::FailPoints::inodedb_claim_freed_pause);
+    std::thread killer([&] { verifyBlobsToRemove(metadata, {}); });
+    DB::FailPointInjection::waitForPause(DB::FailPoints::inodedb_claim_freed_pause);
+
+    auto estimate = std::async(std::launch::async, [&] { return metadata->getDeadBlobsQueueEstimate(); });
+    const bool readable = estimate.wait_for(std::chrono::seconds(30)) == std::future_status::ready;
+    DB::FailPointInjection::disableFailPoint(DB::FailPoints::inodedb_claim_freed_pause);
+    killer.join();
+    EXPECT_TRUE(readable);
 }

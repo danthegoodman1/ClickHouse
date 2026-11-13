@@ -7,6 +7,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/InodeDB/InodeDBClient.h>
 #include <Common/getRandomASCIIString.h>
+#include <Common/randomSeed.h>
 
 #include <grpcpp/create_channel.h>
 #include <grpcpp/security/credentials.h>
@@ -105,7 +106,10 @@ public:
             GTEST_SKIP() << "Set INODEDB_TEST_ENDPOINT and INODEDB_TEST_KEY to run the InodeDB client cases";
         endpoint = getenv("INODEDB_TEST_ENDPOINT");
         key = getenv("INODEDB_TEST_KEY");
-        root = "gtest-client/" + DB::getRandomASCIIString(16);
+        /// A generator of its own: `DiskObjectStorageTest` seeds `thread_local_rng`, and InodeDB keeps the roots of
+        /// earlier runs.
+        static pcg64 rng(randomSeed());
+        root = "gtest-client/" + DB::getRandomASCIIString(16, rng);
     }
 
     DB::InodeDB::Client client(const std::string & address) const

@@ -34,8 +34,11 @@ struct InodeDBMetadataSettings
     /// Files up to this size keep their bytes in their record instead of a blob, so writing them costs no
     /// object-storage request and a directory listing reads them. Smaller than `spill_threshold`.
     size_t inline_file_max_bytes = 16 * 1024;
-    /// Freed files claimed from InodeDB at a time.
-    UInt32 claim_batch = 1000;
+    /// The most bytes one commit writes, counting its inline files' content and `COMMIT_OPERATION_BYTES` for each
+    /// operation. Past them, the commit writes its largest inline files to blobs. InodeDB takes a commit of 8 MiB.
+    size_t commit_max_bytes = 6 * 1024 * 1024;
+    /// Freed files claimed from InodeDB at a time: the most a claim holds, since 60 values fit gRPC's 4 MiB message.
+    UInt32 claim_batch = 60;
     /// A replica's lease holds what InodeDB froze at the versions it read until this long after it read
     /// newer ones, so a query running that long finds every blob it started with.
     std::chrono::milliseconds lease_lag{600'000};
@@ -89,6 +92,14 @@ public:
     bool supportsEmptyFilesWithoutBlobs() const override { return true; }
     bool supportsInlineData() const override { return true; }
     size_t getInlineFileMaxBytes() const override { return settings.inline_file_max_bytes; }
+    /// What InodeDB counts for each operation of a commit beside its inline content: a file of a 60-character name
+    /// costs about 1.2 KiB in its entry, inode, record and log effects.
+    static constexpr size_t COMMIT_OPERATION_BYTES = 1536;
+    size_t getInlineTransactionMaxBytes(size_t operations) const override
+    {
+        const size_t taken = operations * COMMIT_OPERATION_BYTES;
+        return taken < settings.commit_max_bytes ? settings.commit_max_bytes - taken : 0;
+    }
     bool areBlobPathsRandom() const override { return true; }
     bool supportWritingWithAppend() const override { return true; }
     ObjectStorageKeyGeneratorPtr getKeyGenerator() const override { return key_generator; }
@@ -188,9 +199,10 @@ private:
     /// Joins the shared owner, or replaces an exclusive one under its version.
     void joinSharedOwner();
 
-    /// Claims released free-queue entries and queues their blobs. Returns the blobs it queued.
-    StoredObjects pullFreedUnlocked() TSA_REQUIRES(removal_mutex);
-    StoredObjects pullFreed();
+    /// Claims released free-queue entries, at most `claim_batch`, and queues their blobs. Returns the blobs it queued,
+    /// and sets `claimed` to the entries the claim held. It holds `removal_mutex` only to queue them, so commits and
+    /// the blob killer go on while a claim waits for InodeDB.
+    StoredObjects pullFreed(size_t & claimed);
     /// The blobs to delete for a freed entry. `last` gets blobs that must go after the rest: a spill blob.
     StoredObjects blobsToDelete(const InodeDB::pb::Freed & freed, StoredObjects & last) const;
 
