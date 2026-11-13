@@ -25,6 +25,7 @@ namespace ErrorCodes
 {
     extern const int ABORTED;
     extern const int BAD_ARGUMENTS;
+    extern const int LOGICAL_ERROR;
 }
 
 namespace MergeTreeSetting
@@ -204,7 +205,14 @@ void merge(const Engine & engine, const libch::v1::Merge & request, libch::v1::R
         return;
     }
 
-    response.mutable_merged()->set_part(*merged);
+    /// The merge committed the part into this worker's view of the table, which nothing else changes.
+    const auto part = table->getPartIfExists(*merged, {MergeTreeDataPartState::Active});
+    if (!part)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "The merged part {} is not active in {} after its commit", *merged, table->getStorageID().getNameForLogs());
+    auto & answer = *response.mutable_merged();
+    answer.set_part(*merged);
+    answer.set_rows(part->rows_count);
+    answer.set_bytes(part->getBytesOnDisk());
     response.set_status(libch::v1::OK);
 }
 

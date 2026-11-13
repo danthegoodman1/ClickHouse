@@ -153,6 +153,19 @@ message Usage {
   // The worker's anonymous memory, in bytes, and its threads, as it answered.
   uint64 anonymous_memory_bytes = 8;
   uint32 threads = 9;
+  // Time in calls to the store, retries included, in microseconds. Calls on several threads each count, so the
+  // figure can pass the operation's own time.
+  uint64 inodedb_microseconds = 10;
+  // Calls to the store tried again after it was unavailable or slow to answer.
+  uint32 inodedb_retries = 11;
+  // Time in requests to S3 that read, and in requests that write, in microseconds, counted as the store's time is.
+  uint64 s3_read_microseconds = 12;
+  uint64 s3_write_microseconds = 13;
+  // Requests S3 answered with 429 or 503, asking the worker to slow down.
+  uint32 s3_throttled = 14;
+  // Bytes read from S3, and bytes written to it.
+  uint64 s3_bytes_read = 15;
+  uint64 s3_bytes_written = 16;
 }
 
 message Described {
@@ -227,6 +240,9 @@ message MergeCandidate {
 message Merged {
   // The name of the part that now holds the sources' rows.
   string part = 1;
+  // The merged part's rows, and its bytes on disk.
+  uint64 rows = 2;
+  uint64 bytes = 3;
 }
 
 message Housekept {

@@ -15,8 +15,16 @@ namespace ProfileEvents
     extern const Event InodeDBStat;
     extern const Event InodeDBRead;
     extern const Event InodeDBList;
+    extern const Event InodeDBMicroseconds;
+    extern const Event InodeDBRetries;
     extern const Event S3ReadRequestsCount;
     extern const Event S3WriteRequestsCount;
+    extern const Event S3ReadMicroseconds;
+    extern const Event S3WriteMicroseconds;
+    extern const Event S3ReadRequestsThrottling;
+    extern const Event S3WriteRequestsThrottling;
+    extern const Event ReadBufferFromS3Bytes;
+    extern const Event WriteBufferFromS3Bytes;
 }
 
 namespace DB::LibchWorker
@@ -28,6 +36,12 @@ namespace
 UInt32 count(ProfileEvents::Event event)
 {
     return static_cast<UInt32>(ProfileEvents::global_counters[event]);
+}
+
+/// An event's total, for events that count time or bytes.
+UInt64 total(ProfileEvents::Event event)
+{
+    return ProfileEvents::global_counters[event];
 }
 
 UInt64 microseconds(const timeval & time)
@@ -61,6 +75,13 @@ libch::v1::Usage usage()
     usage.set_inodedb_lists(count(ProfileEvents::InodeDBList));
     usage.set_s3_reads(count(ProfileEvents::S3ReadRequestsCount));
     usage.set_s3_writes(count(ProfileEvents::S3WriteRequestsCount));
+    usage.set_inodedb_microseconds(total(ProfileEvents::InodeDBMicroseconds));
+    usage.set_inodedb_retries(count(ProfileEvents::InodeDBRetries));
+    usage.set_s3_read_microseconds(total(ProfileEvents::S3ReadMicroseconds));
+    usage.set_s3_write_microseconds(total(ProfileEvents::S3WriteMicroseconds));
+    usage.set_s3_throttled(count(ProfileEvents::S3ReadRequestsThrottling) + count(ProfileEvents::S3WriteRequestsThrottling));
+    usage.set_s3_bytes_read(total(ProfileEvents::ReadBufferFromS3Bytes));
+    usage.set_s3_bytes_written(total(ProfileEvents::WriteBufferFromS3Bytes));
 
     rusage spent{};
     if (getrusage(RUSAGE_SELF, &spent) == 0)
