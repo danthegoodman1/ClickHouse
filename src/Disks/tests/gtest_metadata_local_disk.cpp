@@ -1776,6 +1776,39 @@ TEST_P(MetadataDiskTest, TestBlobsOfManyRemovedFiles)
     }
 }
 
+TEST_P(MetadataDiskTest, TestStopPassClaimsOnce)
+{
+    if (GetParam() != "inodedb")
+        GTEST_SKIP() << "`local` metadata claims nothing from a server";
+
+    /// The pass a stopping disk runs, with no `max_count`, returns the blobs already queued and one claim more,
+    /// and leaves the rest of the free queue to the next process.
+    auto metadata = getMetadataStorage("/TestStopPassClaimsOnce");
+    constexpr size_t files = 200;
+    const size_t claim_batch = DB::InodeDBMetadataSettings{}.claim_batch;
+
+    {
+        auto tx = metadata->createTransaction();
+        tx->createDirectory("A");
+        for (size_t i = 0; i < files; ++i)
+            tx->createMetadataFile("A/file-" + std::to_string(i), {DB::StoredObject("key-" + std::to_string(i), "file", 1)});
+        tx->commit(DB::NoCommitOptions{});
+    }
+
+    {
+        auto tx = metadata->createTransaction();
+        for (size_t i = 0; i < files; ++i)
+            tx->unlinkFile("A/file-" + std::to_string(i), /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->commit(DB::NoCommitOptions{});
+    }
+
+    const auto queued = static_cast<size_t>(metadata->getDeadBlobsQueueEstimate());
+    ASSERT_LE(queued + claim_batch, files);
+    std::unordered_map<DB::Location, DB::LocationInfo> cluster_registry = {{"main", {true, true, ""}}};
+    auto cluster = std::make_shared<DB::ClusterConfiguration>("disk", std::move(cluster_registry));
+    EXPECT_EQ(metadata->getBlobsToRemove(cluster, /*max_count=*/0).size(), queued + claim_batch);
+}
+
 TEST_P(MetadataDiskTest, TestRemovalQueueReadableDuringClaim)
 {
     if (GetParam() != "inodedb")

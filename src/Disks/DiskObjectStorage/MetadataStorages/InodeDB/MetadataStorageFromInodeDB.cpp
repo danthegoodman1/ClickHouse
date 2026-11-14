@@ -1698,10 +1698,18 @@ IMetadataStorage::BlobsToRemove MetadataStorageFromInodeDB::getBlobsToRemove(con
         return {};
 
     /// A claim holds at most `claim_batch` entries, so claim until the queue holds `max_count` blobs or a claim
-    /// comes back empty.
+    /// comes back empty. The pass a stopping disk runs, with no `max_count`, claims once: the free queue can hold
+    /// far more than a process should delete on its way out, and the next process claims the rest.
     size_t claimed = 1;
-    while (claimed > 0 && (max_count <= 0 || getDeadBlobsQueueEstimate() < max_count))
+    if (max_count <= 0)
+    {
         pullFreed(claimed);
+    }
+    else
+    {
+        while (claimed > 0 && getDeadBlobsQueueEstimate() < max_count)
+            pullFreed(claimed);
+    }
 
     std::lock_guard lock(removal_mutex);
     BlobsToRemove result;
