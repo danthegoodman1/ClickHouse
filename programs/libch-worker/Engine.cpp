@@ -140,6 +140,10 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> makeConfiguration(const libch::v1::T
     /// An exclusive writer may be at work on the tenant's DDL or mutation, and an operation that replaced its
     /// owner would fence it. Only `Share` replaces one: its caller says the exclusive writer is done.
     config->setString(disk + ".inodedb_replace_exclusive_owner", needs.shared_owner ? "1" : "0");
+    /// A worker's process serves one tenant over one channel, some 22 calls for an insert. gRPC's event engine holds
+    /// two threads for its timer and its poller, so four leave two for the calls, where gRPC's own number is one
+    /// for each core, up to 16.
+    config->setString(disk + ".inodedb_grpc_threads", "4");
     /// A disk removes freed blobs in rounds, one of which a transaction waits for and one of which runs at
     /// shutdown. Only an operation that asks for the removal pays for them.
     if (!needs.blob_removal)
