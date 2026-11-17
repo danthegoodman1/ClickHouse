@@ -12,6 +12,8 @@
 
 #include <Poco/Util/AbstractConfiguration.h>
 
+#include <absl/base/internal/sysinfo.h>
+
 #include <boost/algorithm/string/trim.hpp>
 
 namespace DB
@@ -45,6 +47,12 @@ std::string readKey(const Poco::Util::AbstractConfiguration & config, const std:
 
 void registerMetadataStorageFromInodeDB(MetadataStorageFactory & factory)
 {
+    /// gRPC, which the InodeDB client speaks, waits on abseil's mutexes, and the first such wait in a process
+    /// measures the CPU's clock frequency across sleeps of 1 and 2 milliseconds, or longer until two measurements
+    /// agree. A process measures it here, as it starts, so its first call to InodeDB doesn't wait for it, and a
+    /// process forked from this one inherits the result.
+    absl::base_internal::NominalCPUFrequency();
+
     factory.registerMetadataStorageType("inodedb", [](
         const std::string & /* name */,
         const Poco::Util::AbstractConfiguration & config,
@@ -64,6 +72,11 @@ void registerMetadataStorageFromInodeDB(MetadataStorageFactory & factory)
         client_settings.key = readKey(config, config_prefix);
         client_settings.attempt_timeout = std::chrono::milliseconds(config.getUInt64(config_prefix + ".inodedb_attempt_timeout_ms", 10'000));
         client_settings.retry_timeout = std::chrono::milliseconds(config.getUInt64(config_prefix + ".inodedb_retry_timeout_ms", 60'000));
+        client_settings.grpc_threads = config.getUInt64(config_prefix + ".inodedb_grpc_threads", 0);
+        /// The engine's timer and its poller each hold a thread, and the engine starts at most one more a second.
+        if (client_settings.grpc_threads == 1 || client_settings.grpc_threads == 2)
+            throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                "`inodedb_grpc_threads` must be 0, for gRPC's own number, or at least 3: gRPC keeps two threads for itself, and a call would wait a second for a third");
 
         auto object_storage = object_storages->takePointingTo(cluster->getLocalLocation());
 

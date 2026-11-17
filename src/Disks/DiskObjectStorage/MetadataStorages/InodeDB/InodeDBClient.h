@@ -31,6 +31,9 @@ struct ClientSettings
     std::chrono::milliseconds attempt_timeout{10'000};
     /// How long transport failures are retried before a call gives up.
     std::chrono::milliseconds retry_timeout{60'000};
+    /// How many threads gRPC's event engine keeps while idle, for the whole process; 0 leaves gRPC's own number, one
+    /// for each core between 4 and 16.
+    size_t grpc_threads = 0;
 };
 
 /// Every entry of one directory.

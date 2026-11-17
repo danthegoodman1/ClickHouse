@@ -189,9 +189,26 @@ static void registerS3ObjectStorage(ObjectStorageFactory & factory)
                 context->getGlobalContext()->getRemoteHostFilter(),
                 /* throw_on_error */ remote_host_filter_check == RemoteHostFilterCheck::Enforce))
             warnAboutDiskNotAllowedByRemoteHostFilter(name, uri, context->getGlobalContext());
-        auto client = getClient(endpoint, *settings, context, /* for_disk_s3 */ true, name);
         auto key_generator = getKeyGenerator(uri, config, config_prefix);
 
+        /// BigHouse: an `inodedb` disk keeps small files in InodeDB, so a small insert reads and writes no blob, and
+        /// the disk builds its client with its first blob.
+        if (config.getString(config_prefix + ".metadata_type", "") == "inodedb")
+        {
+            auto make_client = [endpoint, client_settings = *settings, global_context = std::weak_ptr<const Context>(context->getGlobalContext()), name]
+            {
+                auto locked_context = global_context.lock();
+                if (!locked_context)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Disk `{}` builds its S3 client after the server's context is gone", name);
+                return getClient(endpoint, client_settings, locked_context, /* for_disk_s3 */ true, name);
+            };
+            return std::make_shared<S3ObjectStorage>(
+                nullptr, std::move(settings), uri, s3_capabilities, key_generator, name,
+                /* for_disk_s3_ */ true, S3ObjectStorage::S3CredentialsRefreshCallback{}, /* client_restricts_server_credentials_ */ true,
+                std::move(make_client));
+        }
+
+        auto client = getClient(endpoint, *settings, context, /* for_disk_s3 */ true, name);
         return std::make_shared<S3ObjectStorage>(std::move(client), std::move(settings), uri, s3_capabilities, key_generator, name);
     };
 

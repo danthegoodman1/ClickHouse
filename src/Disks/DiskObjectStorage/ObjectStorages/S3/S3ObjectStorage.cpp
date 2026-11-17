@@ -771,13 +771,15 @@ void S3ObjectStorage::shutdown()
     /// If S3 request is failed and the method below is executed S3 client immediately returns the last failed S3 request outcome.
     /// If S3 is healthy nothing wrong will be happened and S3 requests will be processed in a regular way without errors.
     /// This should significantly speed up shutdown process if S3 is unhealthy.
-    const_cast<S3::Client &>(*client.get()).DisableRequestProcessing();
+    if (auto built = client.tryGet())
+        const_cast<S3::Client &>(*built).DisableRequestProcessing();
 }
 
 void S3ObjectStorage::startup()
 {
     /// Need to be enabled if it was disabled during shutdown() call.
-    const_cast<S3::Client &>(*client.get()).EnableRequestProcessing();
+    if (auto built = client.tryGet())
+        const_cast<S3::Client &>(*built).EnableRequestProcessing();
 }
 
 void S3ObjectStorage::applyNewSettings(
@@ -854,8 +856,20 @@ void S3ObjectStorage::applyNewSettings(
         || restriction_mode_changed
         || options.force_client_rebuild)
     {
-        auto new_client = getClient(uri, *modified_settings, context, for_disk_s3, disk_name);
-        client.set(std::move(new_client));
+        /// BigHouse: a storage that has built no client builds none here: its first use builds one from these settings.
+        auto make_client = [uri_ = uri, client_settings = *modified_settings, global_context = std::weak_ptr<const Context>(context->getGlobalContext()),
+            for_disk_s3_ = for_disk_s3, disk_name_ = disk_name]
+        {
+            auto locked_context = global_context.lock();
+            if (!locked_context)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Disk `{}` builds its S3 client after the server's context is gone", disk_name_);
+            return getClient(uri_, client_settings, locked_context, for_disk_s3_, disk_name_);
+        };
+        if (!client.setMake(std::move(make_client)))
+        {
+            auto new_client = getClient(uri, *modified_settings, context, for_disk_s3, disk_name);
+            client.set(std::move(new_client));
+        }
         client_restricts_server_credentials = restricts_now;
     }
     s3_settings.set(std::move(modified_settings));
@@ -892,7 +906,8 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::getS3StorageClient()
 
 std::shared_ptr<const S3::Client> S3ObjectStorage::tryGetS3StorageClient()
 {
-    return client.get();
+    /// BigHouse: a caller that asks whether there is a client, as the server's metrics do for each disk, builds none.
+    return client.tryGet();
 }
 
 bool S3ObjectStorage::tryRefreshCredentialsViaCallback()
