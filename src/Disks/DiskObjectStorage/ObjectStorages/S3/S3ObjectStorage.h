@@ -6,7 +6,9 @@
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <atomic>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <IO/S3/S3Capabilities.h>
 #include <IO/S3Settings.h>
 #include <Common/logger_useful.h>
@@ -25,6 +27,54 @@ namespace S3RequestSetting
 }
 
 
+/// BigHouse: a storage's S3 client, built on first use when the storage was given a way to build it. A disk that
+/// keeps small files in its metadata store reads and writes no blob for a small insert, and builds no client for it.
+class S3ClientOnFirstUse
+{
+public:
+    using Make = std::function<std::unique_ptr<S3::Client>()>;
+
+    S3ClientOnFirstUse(std::unique_ptr<S3::Client> && client_, Make make_)
+        : make(std::move(make_))
+    {
+        if (client_)
+        {
+            client.set(std::move(client_));
+            built = true;
+        }
+    }
+
+    std::shared_ptr<const S3::Client> get() const
+    {
+        if (!built.load())
+        {
+            std::lock_guard lock(mutex);
+            if (!built.load())
+            {
+                client.set(make());
+                built = true;
+            }
+        }
+        return client.get();
+    }
+
+    /// The client, if the storage has built one.
+    std::shared_ptr<const S3::Client> tryGet() const { return built.load() ? client.get() : nullptr; }
+
+    void set(std::unique_ptr<const S3::Client> && client_) const
+    {
+        std::lock_guard lock(mutex);
+        client.set(std::move(client_));
+        built = true;
+    }
+
+private:
+    const Make make;
+    mutable std::mutex mutex;
+    mutable std::atomic<bool> built = false;
+    mutable MultiVersion<S3::Client> client;
+};
+
 class S3ObjectStorage : public IObjectStorage
 {
 public:
@@ -41,10 +91,11 @@ private:
         const String & disk_name_,
         bool for_disk_s3_ = true,
         const S3CredentialsRefreshCallback & credentials_refresh_callback_ = {},
-        bool client_restricts_server_credentials_ = true)
+        bool client_restricts_server_credentials_ = true,
+        S3ClientOnFirstUse::Make make_client_ = {})
         : uri(uri_)
         , disk_name(disk_name_)
-        , client(std::move(client_))
+        , client(std::move(client_), std::move(make_client_))
         , client_restricts_server_credentials(client_restricts_server_credentials_)
         , s3_settings(std::move(s3_settings_))
         , s3_capabilities(s3_capabilities_)
@@ -181,7 +232,7 @@ private:
 
     std::string disk_name;
 
-    mutable MultiVersion<S3::Client> client;
+    S3ClientOnFirstUse client;
     /// The user-query credential restriction mode the current `client` was built under (initialized by the
     /// caller from the policy used to build the initial client -- e.g. a table created with the opt-in starts
     /// `false`). `applyNewSettings` rebuilds the client when a session with a different restriction mode accesses

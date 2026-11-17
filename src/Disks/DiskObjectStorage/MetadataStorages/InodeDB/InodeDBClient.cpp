@@ -13,6 +13,7 @@
 
 #include <pcg_random.hpp>
 
+#include <grpc_event_engine_threads.h>
 #include <grpcpp/create_channel.h>
 #include <grpcpp/security/credentials.h>
 #include <grpcpp/support/channel_arguments.h>
@@ -115,6 +116,9 @@ Client::Client(ClientSettings settings_)
     , authorization("Bearer " + settings.key)
 {
     settings.endpoint = stripScheme(settings.endpoint);
+    /// gRPC creates its event engine with the process's first channel.
+    if (settings.grpc_threads)
+        grpcSetEventEngineReserveThreads(settings.grpc_threads);
     channel = connect(settings.endpoint);
 }
 

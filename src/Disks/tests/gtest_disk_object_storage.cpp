@@ -17,6 +17,7 @@
 #include <Common/tests/gtest_global_context.h>
 #include <Common/Config/ConfigProcessor.h>
 #include <Common/FailPoint.h>
+#include <Common/ProfileEvents.h>
 #include <Common/thread_local_rng.h>
 
 #include <Core/Defines.h>
@@ -35,12 +36,21 @@
 #include <Common/randomSeed.h>
 #endif
 
+#if USE_AWS_S3
+#include <IO/S3/Client.h>
+#endif
+
 #include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <thread>
 
 namespace fs = std::filesystem;
+
+namespace ProfileEvents
+{
+    extern const Event S3Clients;
+}
 
 namespace
 {
@@ -1229,7 +1239,11 @@ struct InodeDBTestDisk
 
     DB::DiskPtr disk;
 
-    explicit InodeDBTestDisk(DB::ContextPtr context)
+    /// `settings` are further settings of the disk, and `blobs` names where its blobs go.
+    explicit InodeDBTestDisk(
+        DB::ContextPtr context,
+        const std::string & settings = {},
+        const std::string & blobs = "<object_storage_type>local_blob_storage</object_storage_type><path>inodedb_blob_storage_dir/</path>")
     {
         const char * endpoint = std::getenv("INODEDB_TEST_ENDPOINT"); // NOLINT(concurrency-mt-unsafe)
         const char * admin_key = std::getenv("INODEDB_TEST_KEY"); // NOLINT(concurrency-mt-unsafe)
@@ -1255,12 +1269,12 @@ struct InodeDBTestDisk
             DB::WriteBufferFromFile wb(config_file);
             DB::writeText(fmt::format(R"(<clickhouse><storage_configuration><disks><inodedb_disk>
                 <type>object_storage</type>
-                <object_storage_type>local_blob_storage</object_storage_type>
-                <path>inodedb_blob_storage_dir/</path>
+                {}
                 <metadata_type>inodedb</metadata_type>
                 <inodedb_endpoint>{}</inodedb_endpoint>
                 <inodedb_key>{}</inodedb_key>
-            </inodedb_disk></disks></storage_configuration></clickhouse>)", endpoint, key), wb);
+                {}
+            </inodedb_disk></disks></storage_configuration></clickhouse>)", blobs, endpoint, key, settings), wb);
             wb.finalize();
         }
         DB::ConfigProcessor config_processor(config_file, true, true);
@@ -1533,4 +1547,82 @@ catch (...)
 {
     FAIL() << DB::getCurrentExceptionMessage(true);
 }
+/// BigHouse: gRPC keeps two of its event engine's threads for itself, so a disk refuses to leave it one or two.
+TEST_F(DiskObjectStorageTest, InodeDBRefusesFewerThanThreeGrpcThreads)
+try
+{
+    if (!std::getenv("INODEDB_TEST_ENDPOINT") || !std::getenv("INODEDB_TEST_KEY")) // NOLINT(concurrency-mt-unsafe)
+        GTEST_SKIP() << inodedb_skip_reason;
+
+    for (size_t threads : {1, 2})
+    {
+        try
+        {
+            InodeDBTestDisk test(getContext().context, fmt::format("<inodedb_grpc_threads>{}</inodedb_grpc_threads>", threads));
+            FAIL() << "A disk with " << threads << " gRPC threads attached";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_NE(e.message().find("`inodedb_grpc_threads` must be 0"), std::string::npos) << e.message();
+        }
+    }
+    fs::remove(InodeDBTestDisk::config_file);
+
+    InodeDBTestDisk test(getContext().context, "<inodedb_grpc_threads>3</inodedb_grpc_threads>");
+    ASSERT_TRUE(test.disk);
+    test.disk->createDirectories("attached");
+    EXPECT_TRUE(test.disk->existsDirectory("attached"));
+}
+catch (...)
+{
+    FAIL() << DB::getCurrentExceptionMessage(true);
+}
+
+#if USE_AWS_S3
+/// BigHouse: an `inodedb` disk on S3 builds its client with its first blob, once, whichever thread comes first.
+TEST_F(DiskObjectStorageTest, InodeDBDiskBuildsItsS3ClientOnFirstUse)
+try
+{
+    auto clients = [] { return ProfileEvents::global_counters[ProfileEvents::S3Clients]; };
+    const auto before = clients();
+
+    /// Nothing listens at this endpoint: the test builds the client and sends it no request.
+    InodeDBTestDisk test(getContext().context, {}, R"(<object_storage_type>s3</object_storage_type>
+        <endpoint>http://127.0.0.1:9/bucket/prefix/</endpoint>
+        <access_key_id>key</access_key_id>
+        <secret_access_key>secret</secret_access_key>)");
+    if (!test.disk)
+        GTEST_SKIP() << inodedb_skip_reason;
+    auto & disk = test.disk;
+
+    /// A file that stays in InodeDB commits and reads back without the client.
+    {
+        auto tx = disk->createTransaction();
+        auto wb = tx->writeFile("small", DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteMode::Rewrite, DB::WriteSettings{});
+        DB::writeString("a few bytes", *wb);
+        wb->finalize();
+        tx->commit();
+    }
+    EXPECT_EQ(readAll(*disk->readFile("small", {})), "a few bytes");
+    EXPECT_EQ(clients(), before);
+
+    const size_t threads = 16;
+    std::vector<std::shared_ptr<const DB::S3::Client>> seen(threads);
+    {
+        std::vector<std::thread> pool;
+        for (size_t i = 0; i < threads; ++i)
+            pool.emplace_back([&, i] { seen[i] = disk->getS3StorageClient(); });
+        for (auto & thread : pool)
+            thread.join();
+    }
+    EXPECT_EQ(clients(), before + 1);
+    ASSERT_TRUE(seen[0]);
+    for (const auto & client : seen)
+        EXPECT_EQ(client, seen[0]);
+}
+catch (...)
+{
+    FAIL() << DB::getCurrentExceptionMessage(true);
+}
+#endif
 #endif

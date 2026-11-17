@@ -29,7 +29,13 @@ if (OS_SUNOS)
   endforeach()
 endif()
 
-set(gRPC_INCLUDE_DIRS "${ClickHouse_SOURCE_DIR}/contrib/grpc/include")
+# BigHouse: `grpcSetEventEngineReserveThreads`, which reads gRPC's own headers.
+foreach (target grpc grpc_unsecure)
+  target_sources(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/event_engine_threads.cc")
+  target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+endforeach()
+
+set(gRPC_INCLUDE_DIRS "${ClickHouse_SOURCE_DIR}/contrib/grpc/include" "${CMAKE_CURRENT_SOURCE_DIR}/include")
 if(gRPC_USE_UNSECURE_LIBRARIES)
   set(gRPC_LIBRARIES grpc_unsecure grpc++_unsecure)
 else()
