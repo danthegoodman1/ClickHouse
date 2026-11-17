@@ -104,6 +104,8 @@ public:
         const size_t taken = operations * COMMIT_OPERATION_BYTES;
         return taken < settings.commit_max_bytes ? settings.commit_max_bytes - taken : 0;
     }
+    /// A transaction of more operations commits in stages, since a batch of them passes InodeDB's limits.
+    size_t getCommitMaxOperations() const override { return settings.commit_max_bytes / COMMIT_OPERATION_BYTES; }
     bool areBlobPathsRandom() const override { return true; }
     bool supportWritingWithAppend() const override { return true; }
     ObjectStorageKeyGeneratorPtr getKeyGenerator() const override { return key_generator; }
@@ -303,6 +305,13 @@ public:
     /// Commits the intents with `extra` joined to the batch.
     InodeDBCommitOutcome commitWith(const InodeDBCommitOptions * extra);
 
+    /// A stage's batch touches `directory`, which leaves it at the batch's version. Every batch of the transaction
+    /// after the first, its last commit included, opens with a touch that requires the version the batch before
+    /// left. A directory that anything removed or wrote to in between fails it, so the last commit publishes every
+    /// stage or nothing.
+    UInt64 commitStage(const std::string & directory, std::optional<UInt64> previous) override;
+    void requireStage(const std::string & directory, UInt64 version) override;
+
     void writeStringToFile(const std::string & path, const std::string & data) override;
     void writeInlineDataToFile(const std::string & path, const std::string & data) override;
     void setLastModified(const std::string & path, const Poco::Timestamp & timestamp) override;
@@ -344,9 +353,19 @@ private:
     /// Whether every intent creates a directory that exists or removes a path that is absent.
     bool changesNothing() const;
 
+    struct Stage
+    {
+        /// The staging directory, normalized.
+        std::string directory;
+        /// The version the batch before this one left the directory at. Nothing for the first stage.
+        std::optional<UInt64> previous;
+    };
+
     MetadataStorageFromInodeDB & storage;
     std::vector<Intent> intents;
     StoredObjects submitted_for_removal;
+    /// Set when the batch is a stage, or follows one.
+    std::optional<Stage> stage;
 };
 
 }

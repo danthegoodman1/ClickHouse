@@ -37,6 +37,7 @@ static struct InitFiu
     PAUSEABLE_ONCE(inodedb_insert_pause_before_commit) \
     PAUSEABLE_ONCE(inodedb_insert_pause_after_commit) \
     PAUSEABLE_ONCE(inodedb_merge_pause_before_commit) \
+    PAUSEABLE(inodedb_pause_after_stage) \
     REGULAR(inodedb_list_in_pages) \
     PAUSEABLE_ONCE(inodedb_list_pause_between_pages) \
     PAUSEABLE_ONCE(inodedb_claim_freed_pause) \

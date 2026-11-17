@@ -33,6 +33,7 @@ namespace fs = std::filesystem;
 namespace ProfileEvents
 {
     extern const Event InodeDBCommitConflicts;
+    extern const Event InodeDBCommitStages;
     extern const Event InodeDBFreedClaimed;
 }
 
@@ -48,6 +49,7 @@ namespace FailPoints
 
 namespace ErrorCodes
 {
+    extern const int ABORTED;
     extern const int BAD_ARGUMENTS;
     extern const int CANNOT_RMDIR;
     extern const int CANNOT_UNLINK;
@@ -268,9 +270,13 @@ public:
     }
 
     void apply(const Intent & intent, size_t intent_index);
+    /// Touches a staging directory, which leaves it at the batch's version. With `required`, the touch applies
+    /// only to a directory at that version.
+    void touchStage(const std::string & directory, std::optional<UInt64> required);
     pb::CommitRequest finish();
 
     std::optional<size_t> intentOfOp(size_t op_index) const { return op_intents.at(op_index); }
+    bool isStageTouch(size_t op_index) const { return stage_touch == op_index; }
     bool isBlindCreate(size_t op_index) const { return blind_creates.at(op_index); }
     bool freesAnything() const { return frees; }
     const std::vector<std::string> & blobsWritten() const { return written_blobs; }
@@ -334,6 +340,7 @@ private:
     /// Blobs this batch wrote: spilled records and inline bytes moved out by an append.
     std::vector<std::string> written_blobs;
     bool frees = false;
+    std::optional<size_t> stage_touch;
 };
 
 InodeDBBatchBuilder::FileNodePtr InodeDBBatchBuilder::lookup(const std::string & path)
@@ -772,6 +779,22 @@ void InodeDBBatchBuilder::apply(const Intent & intent, size_t intent_index)
             break;
         }
     }
+}
+
+void InodeDBBatchBuilder::touchStage(const std::string & directory, std::optional<UInt64> required)
+{
+    const std::string tree_path = MetadataStorageFromInodeDB::treePath(directory);
+    pb::Op op;
+    op.mutable_set_attr()->set_path(tree_path);
+    op.mutable_set_attr()->set_mtime(ctime * 1000);
+    if (required)
+    {
+        auto * version_is = op.add_cond()->mutable_version_is();
+        version_is->set_path(tree_path);
+        version_is->set_version(*required);
+    }
+    stage_touch = request.ops_size();
+    emit(std::move(op), std::nullopt);
 }
 
 pb::CommitRequest InodeDBBatchBuilder::finish()
@@ -1903,8 +1926,14 @@ MetadataStorageFromInodeDBTransaction::AttemptResult MetadataStorageFromInodeDBT
     pb::CommitRequest request;
     try
     {
+        /// The touch that requires the batch before this one comes first, ahead of anything this batch changes
+        /// under the directory. The first stage creates the directory, so its touch comes last.
+        if (stage && stage->previous)
+            builder.touchStage(stage->directory, stage->previous);
         for (size_t i = 0; i < intents.size(); ++i)
             builder.apply(intents[i], i);
+        if (stage && !stage->previous)
+            builder.touchStage(stage->directory, std::nullopt);
         request = builder.finish();
     }
     catch (...)
@@ -1974,6 +2003,11 @@ MetadataStorageFromInodeDBTransaction::AttemptResult MetadataStorageFromInodeDBT
                 "{} lost ownership: another server took over the disk, so this one can no longer write", storage.description);
 
         const auto & op = request.ops(i);
+        if (skipped.reason_case() == pb::Skipped::kCond && builder.isStageTouch(i))
+            throw Exception(ErrorCodes::ABORTED,
+                "{} can't finish a transaction it committed in stages under `{}`: the directory changed since the transaction's "
+                "last commit there, as when another server removes it as a leftover. The transaction published nothing; "
+                "retry the operation", storage.description, stage->directory);
         if (skipped.reason_case() != pb::Skipped::kError)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "InodeDB skipped op {} (`{}`) for {}", i, opPath(op), skipped.ShortDebugString());
 
@@ -1991,7 +2025,8 @@ MetadataStorageFromInodeDBTransaction::AttemptResult MetadataStorageFromInodeDBT
         }
 
         if (!intent_index)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "InodeDB refused a tombstone at `{}` with {}", opPath(op), pb::Error_Name(skipped.error()));
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "InodeDB refused {} at `{}` with {}",
+                builder.isStageTouch(i) ? "a touch of a staging directory" : "a tombstone", opPath(op), pb::Error_Name(skipped.error()));
 
         const auto & intent = intents[*intent_index];
         throw Exception(errorCodeOf(op, skipped.error(), intent.kind == IntentKind::MoveDirectory),
@@ -2020,7 +2055,7 @@ void MetadataStorageFromInodeDBTransaction::commit(const TransactionCommitOption
 
 InodeDBCommitOutcome MetadataStorageFromInodeDBTransaction::commitWith(const InodeDBCommitOptions * extra)
 {
-    if (intents.empty() && (!extra || (extra->ops.empty() && extra->when.empty())))
+    if (intents.empty() && !stage && (!extra || (extra->ops.empty() && extra->when.empty())))
         return {};
     /// `DiskObjectStorage::createDirectories` commits even for directories that exist, as when a replica attaches a
     /// database from this disk. Such a transaction changes nothing, so a read-only disk commits it, as `local` does.
@@ -2083,6 +2118,32 @@ InodeDBCommitOutcome MetadataStorageFromInodeDBTransaction::commitWith(const Ino
         tryLogCurrentException(storage.log, "Claiming freed files after a commit");
     }
     return outcome;
+}
+
+UInt64 MetadataStorageFromInodeDBTransaction::commitStage(const std::string & directory, std::optional<UInt64> previous)
+{
+    const std::string normal = normalize(directory);
+    if (normal.empty() || intents.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "A stage needs a directory and operations: it has `{}` and {} intents", directory, intents.size());
+
+    for (const auto & intent : intents)
+    {
+        /// A hardlink changes its new name alone.
+        const bool confined = (intent.kind == IntentKind::CreateHardLink || isUnder(normalize(intent.path), normal))
+            && (intent.path_to.empty() || isUnder(normalize(intent.path_to), normal));
+        if (!confined)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "{} changes a path outside `{}`, where its transaction commits in stages", intent.describe(), directory);
+    }
+
+    stage = Stage{.directory = normal, .previous = previous};
+    const UInt64 version = commitWith(nullptr).version;
+    ProfileEvents::increment(ProfileEvents::InodeDBCommitStages);
+    return version;
+}
+
+void MetadataStorageFromInodeDBTransaction::requireStage(const std::string & directory, UInt64 version)
+{
+    stage = Stage{.directory = normalize(directory), .previous = version};
 }
 
 bool MetadataStorageFromInodeDBTransaction::onlyCreatesExistingDirectories() const
