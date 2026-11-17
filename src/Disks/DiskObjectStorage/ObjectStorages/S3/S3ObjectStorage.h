@@ -68,8 +68,18 @@ public:
         built = true;
     }
 
+    /// Replaces the way to build the client, and returns false if the storage has built one.
+    bool setMake(Make make_) const
+    {
+        std::lock_guard lock(mutex);
+        if (built.load())
+            return false;
+        make = std::move(make_);
+        return true;
+    }
+
 private:
-    const Make make;
+    mutable Make make;
     mutable std::mutex mutex;
     mutable std::atomic<bool> built = false;
     mutable MultiVersion<S3::Client> client;
