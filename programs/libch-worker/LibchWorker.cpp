@@ -289,7 +289,7 @@ libch::v1::Response responseOfCurrentException()
     return response;
 }
 
-libch::v1::Response serve(Engine & engine, const libch::v1::Request & request, ReadBuffer & in)
+libch::v1::Response serve(Engine & engine, const libch::v1::Request & request, ReadBufferFromDataFrames & batch)
 {
     libch::v1::Response response;
     engine.attachTenant(
@@ -309,7 +309,7 @@ libch::v1::Response serve(Engine & engine, const libch::v1::Request & request, R
             response.set_status(libch::v1::OK);
             break;
         case libch::v1::Request::kInsert:
-            insert(engine, request.insert(), in, response);
+            insert(engine, request.insert(), batch, response);
             break;
         case libch::v1::Request::kMerge:
             merge(engine, request.merge(), response);
@@ -346,16 +346,23 @@ bool serveOne(Engine & engine, LoggerPtr log)
     if (!request.ParseFromString(*frame))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "The request of {} bytes is no `libch.v1.Request`", frame->size());
 
+    /// An insert's batch follows its request on the stream.
+    ReadBufferFromDataFrames batch(in);
     libch::v1::Response response;
     try
     {
-        response = serve(engine, request, in);
+        response = serve(engine, request, batch);
     }
     catch (...)
     {
         tryLogCurrentException(log, "The operation failed");
         response = responseOfCurrentException();
     }
+
+    /// The worker reads the whole batch whatever became of its insert, as when the tenant is fenced, the table is
+    /// absent or a row fails to parse: a forking worker's next child reads its request from the same stream.
+    if (request.has_insert())
+        batch.drain();
 
     /// Housekeeping ends by removing the blobs of what the tenant's disk freed, in this operation and before it.
     if (response.has_housekept())

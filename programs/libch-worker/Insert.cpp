@@ -200,7 +200,7 @@ StoragePtr tableWithoutTokens(const std::vector<StoragePtr> & tables)
 
 }
 
-void insert(const Engine & engine, const libch::v1::Insert & request, ReadBuffer & in, libch::v1::Response & response)
+void insert(const Engine & engine, const libch::v1::Insert & request, ReadBufferFromDataFrames & batch, libch::v1::Response & response)
 {
     const auto & name = request.table();
     if (name.database().empty() || name.table().empty())
@@ -266,7 +266,6 @@ void insert(const Engine & engine, const libch::v1::Insert & request, ReadBuffer
     /// The query's text and the batch reach the engine as one stream, as an INSERT over HTTP does.
     const std::string query = fmt::format("INSERT INTO {}.{} FORMAT {}\n", backQuote(name.database()), backQuote(name.table()), request.format());
     ReadBufferFromString query_text(query);
-    ReadBufferFromDataFrames batch(in);
     ConcatReadBuffer stream(query_text, batch);
     NullWriteBuffer no_output;
     {

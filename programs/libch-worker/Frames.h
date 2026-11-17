@@ -30,6 +30,9 @@ public:
     /// Whether the frame of length zero has been read.
     bool ended() const { return batch_ended; }
 
+    /// Reads the rest of the batch from the stream and drops it, through the frame of length zero.
+    void drain();
+
 private:
     bool nextImpl() override;
 

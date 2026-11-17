@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Engine.h"
+#include "Frames.h"
 
 #include <IO/ReadBuffer.h>
 
@@ -16,7 +17,7 @@ libch::v1::Described describe(const Engine & engine, const libch::v1::Describe &
 
 /// Inserts the batch that follows the request on `in` into a table and, through its materialized views, into their
 /// targets. Sets the response's status and, for an insert that ran, the parts it committed.
-void insert(const Engine & engine, const libch::v1::Insert & request, ReadBuffer & in, libch::v1::Response & response);
+void insert(const Engine & engine, const libch::v1::Insert & request, ReadBufferFromDataFrames & batch, libch::v1::Response & response);
 
 /// Proposes merges for a table as a shared writer's selector would choose them, and runs none.
 void plan(const Engine & engine, const libch::v1::Plan & request, libch::v1::Response & response);

@@ -83,6 +83,31 @@ bool ReadBufferFromDataFrames::nextImpl()
     return true;
 }
 
+void ReadBufferFromDataFrames::drain()
+{
+    /// What the buffer holds goes with the rest.
+    working_buffer = Buffer(internal_buffer.begin(), internal_buffer.begin());
+    pos = working_buffer.begin();
+
+    while (!batch_ended)
+    {
+        if (left_in_frame == 0)
+        {
+            auto length = readFrameLength(in);
+            if (!length)
+                throw Exception(ErrorCodes::CANNOT_READ_ALL_DATA, "The batch ended without its frame of length zero");
+            if (*length == 0)
+            {
+                batch_ended = true;
+                return;
+            }
+            left_in_frame = *length;
+        }
+        in.ignore(left_in_frame);
+        left_in_frame = 0;
+    }
+}
+
 }
 
 }
