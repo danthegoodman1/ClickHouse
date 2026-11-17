@@ -60,6 +60,11 @@ size_t MetadataStorageFromCacheObjectStorage::getInlineTransactionMaxBytes(size_
     return underlying->getInlineTransactionMaxBytes(operations);
 }
 
+size_t MetadataStorageFromCacheObjectStorage::getCommitMaxOperations() const
+{
+    return underlying->getCommitMaxOperations();
+}
+
 bool MetadataStorageFromCacheObjectStorage::appliesOperationsEagerly() const
 {
     return underlying->appliesOperationsEagerly();
@@ -311,6 +316,22 @@ void MetadataStorageFromCacheObjectStorageTransaction::commit(const TransactionC
         std::lock_guard guard(metadata_storage.removed_objects_mutex);
         metadata_storage.objects_to_remove.submitForRemoval(underlying->getSubmittedForRemovalBlobs());
     }
+}
+
+UInt64 MetadataStorageFromCacheObjectStorageTransaction::commitStage(const std::string & directory, std::optional<UInt64> previous)
+{
+    const UInt64 version = underlying->commitStage(directory, previous);
+
+    {
+        std::lock_guard guard(metadata_storage.removed_objects_mutex);
+        metadata_storage.objects_to_remove.submitForRemoval(underlying->getSubmittedForRemovalBlobs());
+    }
+    return version;
+}
+
+void MetadataStorageFromCacheObjectStorageTransaction::requireStage(const std::string & directory, UInt64 version)
+{
+    underlying->requireStage(directory, version);
 }
 
 TransactionCommitOutcomeVariant MetadataStorageFromCacheObjectStorageTransaction::tryCommit(const TransactionCommitOptionsVariant & options)

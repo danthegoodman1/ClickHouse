@@ -146,6 +146,7 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int ABORTED;
     extern const int LOGICAL_ERROR;
 }
 
@@ -1216,49 +1217,113 @@ catch (...)
 #endif
 
 #if USE_GRPC
+namespace
+{
+
+/// BigHouse: a disk with `inodedb` metadata under an InodeDB root of its own, and blobs in a local directory. Needs an
+/// InodeDB server: `INODEDB_TEST_ENDPOINT` and an admin key in `INODEDB_TEST_KEY`. Without them, `disk` is null.
+struct InodeDBTestDisk
+{
+    static constexpr auto config_file = "./inodedb_disk_config_for_test.xml";
+    static constexpr auto blob_directory = "./inodedb_blob_storage_dir";
+
+    DB::DiskPtr disk;
+
+    explicit InodeDBTestDisk(DB::ContextPtr context)
+    {
+        const char * endpoint = std::getenv("INODEDB_TEST_ENDPOINT"); // NOLINT(concurrency-mt-unsafe)
+        const char * admin_key = std::getenv("INODEDB_TEST_KEY"); // NOLINT(concurrency-mt-unsafe)
+        if (!endpoint || !admin_key)
+            return;
+
+        DB::InodeDB::Client admin({.endpoint = endpoint, .key = admin_key});
+        /// A generator of its own: `SetUp` seeds `thread_local_rng`, and InodeDB keeps the roots of earlier runs.
+        static pcg64 rng(randomSeed());
+        const std::string root = "gtest/" + DB::getRandomASCIIString(16, rng);
+        DB::InodeDB::pb::CommitRequest mkdir;
+        auto * op = mkdir.add_ops()->mutable_mkdir();
+        op->set_path(root);
+        op->set_parents(true);
+        admin.commit(mkdir);
+        DB::InodeDB::pb::MintKeyRequest mint;
+        mint.set_root(root);
+        mint.set_grant(DB::InodeDB::pb::WRITE);
+        const std::string key = admin.mintKey(mint).key();
+
+        fs::remove_all(blob_directory);
+        {
+            DB::WriteBufferFromFile wb(config_file);
+            DB::writeText(fmt::format(R"(<clickhouse><storage_configuration><disks><inodedb_disk>
+                <type>object_storage</type>
+                <object_storage_type>local_blob_storage</object_storage_type>
+                <path>inodedb_blob_storage_dir/</path>
+                <metadata_type>inodedb</metadata_type>
+                <inodedb_endpoint>{}</inodedb_endpoint>
+                <inodedb_key>{}</inodedb_key>
+            </inodedb_disk></disks></storage_configuration></clickhouse>)", endpoint, key), wb);
+            wb.finalize();
+        }
+        DB::ConfigProcessor config_processor(config_file, true, true);
+        auto config = config_processor.loadConfig(false);
+        DB::DisksMap disks;
+        disk = DB::DiskFactory::instance().create(
+            "inodedb_disk", *config.configuration, "storage_configuration.disks.inodedb_disk", context, disks,
+            /*attach*/ false, /*custom_disk*/ false, /*skip_types*/ {});
+    }
+
+    ~InodeDBTestDisk()
+    {
+        if (disk)
+            disk->shutdown();
+        fs::remove_all(blob_directory);
+        fs::remove(config_file);
+    }
+
+    size_t blobs() const
+    {
+        DB::RelativePathsWithMetadata listed;
+        disk->getObjectStorage()->listObjects(fs::path(disk->getObjectStorage()->getCommonKeyPrefix()) / "", listed, /*max_keys=*/ 0);
+        return listed.size();
+    }
+
+    size_t filesIn(const std::string & directory) const
+    {
+        std::vector<std::string> names;
+        disk->listFiles(directory, names);
+        return names.size();
+    }
+
+    /// What `writeFiles` writes to file `i`: 20,000 bytes for a blob, more than a record keeps inline, or a few.
+    static std::string content(size_t i, bool blob)
+    {
+        return blob ? std::string(20'000, static_cast<char>('a' + i % 26)) + std::to_string(i) : fmt::format("content of file {}", i);
+    }
+
+    /// Writes a file named `file_` and its number into `directory` for each number in the range, through `tx`.
+    static void writeFiles(DB::IDiskTransaction & tx, const std::string & directory, size_t from, size_t to, const std::function<bool(size_t)> & is_blob)
+    {
+        for (size_t i = from; i < to; ++i)
+        {
+            auto wb = tx.writeFile(fmt::format("{}/file_{}", directory, i), DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteMode::Rewrite, DB::WriteSettings{});
+            DB::writeString(content(i, is_blob(i)), *wb);
+            wb->finalize();
+        }
+    }
+};
+
+const char * const inodedb_skip_reason = "Set INODEDB_TEST_ENDPOINT and INODEDB_TEST_KEY to run the inodedb cases";
+
+}
+
 /// BigHouse: a transaction whose files and inline bytes pass what one InodeDB commit holds writes its largest inline
-/// files to blobs. Needs an InodeDB server: `INODEDB_TEST_ENDPOINT` and an admin key in `INODEDB_TEST_KEY`.
+/// files to blobs.
 TEST_F(DiskObjectStorageTest, InodeDBCommitWritesInlineFilesPastItsLimitToBlobs)
 try
 {
-    const char * endpoint = std::getenv("INODEDB_TEST_ENDPOINT"); // NOLINT(concurrency-mt-unsafe)
-    const char * admin_key = std::getenv("INODEDB_TEST_KEY"); // NOLINT(concurrency-mt-unsafe)
-    if (!endpoint || !admin_key)
-        GTEST_SKIP() << "Set INODEDB_TEST_ENDPOINT and INODEDB_TEST_KEY to run the inodedb cases";
-
-    DB::InodeDB::Client admin({.endpoint = endpoint, .key = admin_key});
-    /// A generator of its own: `SetUp` seeds `thread_local_rng`, and InodeDB keeps the roots of earlier runs.
-    static pcg64 rng(randomSeed());
-    const std::string root = "gtest/" + DB::getRandomASCIIString(16, rng);
-    DB::InodeDB::pb::CommitRequest mkdir;
-    auto * op = mkdir.add_ops()->mutable_mkdir();
-    op->set_path(root);
-    op->set_parents(true);
-    admin.commit(mkdir);
-    DB::InodeDB::pb::MintKeyRequest mint;
-    mint.set_root(root);
-    mint.set_grant(DB::InodeDB::pb::WRITE);
-    const std::string key = admin.mintKey(mint).key();
-
-    const std::string config_file = "./inodedb_disk_config_for_test.xml";
-    {
-        DB::WriteBufferFromFile wb(config_file);
-        DB::writeText(fmt::format(R"(<clickhouse><storage_configuration><disks><inodedb_disk>
-            <type>object_storage</type>
-            <object_storage_type>local_blob_storage</object_storage_type>
-            <path>inodedb_blob_storage_dir/</path>
-            <metadata_type>inodedb</metadata_type>
-            <inodedb_endpoint>{}</inodedb_endpoint>
-            <inodedb_key>{}</inodedb_key>
-        </inodedb_disk></disks></storage_configuration></clickhouse>)", endpoint, key), wb);
-        wb.finalize();
-    }
-    DB::ConfigProcessor config_processor(config_file, true, true);
-    auto config = config_processor.loadConfig(false);
-    DB::DisksMap disks;
-    auto disk = DB::DiskFactory::instance().create(
-        "inodedb_disk", *config.configuration, "storage_configuration.disks.inodedb_disk", getContext().context, disks,
-        /*attach*/ false, /*custom_disk*/ false, /*skip_types*/ {});
+    InodeDBTestDisk test(getContext().context);
+    if (!test.disk)
+        GTEST_SKIP() << inodedb_skip_reason;
+    auto & disk = test.disk;
 
     /// 600 files of 15,000 bytes, each small enough to inline, hold 9 MB together: more than one InodeDB commit takes.
     const size_t files = 600;
@@ -1277,14 +1342,192 @@ try
         EXPECT_EQ(readAll(*disk->readFile(fmt::format("part/file_{}", i), {})), content(i));
 
     /// Some files went to blobs, and the rest stayed inline.
-    DB::RelativePathsWithMetadata blobs;
-    disk->getObjectStorage()->listObjects(fs::path(disk->getObjectStorage()->getCommonKeyPrefix()) / "", blobs, /*max_keys=*/ 0);
-    EXPECT_GT(blobs.size(), 0);
-    EXPECT_LT(blobs.size(), files);
+    EXPECT_GT(test.blobs(), 0);
+    EXPECT_LT(test.blobs(), files);
+}
+catch (...)
+{
+    FAIL() << DB::getCurrentExceptionMessage(true);
+}
 
-    disk->shutdown();
-    fs::remove_all("./inodedb_blob_storage_dir");
-    fs::remove(config_file);
+/// BigHouse: a transaction of more operations than one InodeDB commit holds commits its staging directory in stages,
+/// and its last commit publishes the directory with every file.
+TEST_F(DiskObjectStorageTest, InodeDBTransactionPastOneCommitCommitsInStages)
+try
+{
+    InodeDBTestDisk test(getContext().context);
+    if (!test.disk)
+        GTEST_SKIP() << inodedb_skip_reason;
+    auto & disk = test.disk;
+    disk->createDirectories("table");
+
+    /// More files than InodeDB takes ops in a batch, with a blob among every hundred.
+    const size_t files = 12'000;
+    auto is_blob = [](size_t i) { return i % 100 == 0; };
+    auto tx = disk->createTransaction();
+    tx->setStagingDirectory("table/tmp_part");
+    tx->createDirectories("table/tmp_part");
+    InodeDBTestDisk::writeFiles(*tx, "table/tmp_part", 0, files, is_blob);
+    EXPECT_FALSE(disk->existsDirectory("table/tmp_part"));
+
+    /// The stages leave what fits one commit.
+    tx->commitStages();
+    const size_t staged = test.filesIn("table/tmp_part");
+    EXPECT_GT(staged, files - 4096);
+    EXPECT_LT(staged, files);
+
+    /// A second call finds nothing more to stage.
+    tx->commitStages();
+    EXPECT_EQ(test.filesIn("table/tmp_part"), staged);
+
+    tx->moveDirectory("table/tmp_part", "table/part");
+    EXPECT_FALSE(disk->existsDirectory("table/part"));
+    tx->commit();
+
+    EXPECT_FALSE(disk->existsDirectory("table/tmp_part"));
+    EXPECT_EQ(test.filesIn("table/part"), files);
+    for (size_t i = 0; i < files; ++i)
+        EXPECT_EQ(readAll(*disk->readFile(fmt::format("table/part/file_{}", i), {})), InodeDBTestDisk::content(i, is_blob(i)));
+    EXPECT_EQ(test.blobs(), files / 100);
+}
+catch (...)
+{
+    FAIL() << DB::getCurrentExceptionMessage(true);
+}
+
+/// BigHouse: a transaction that one InodeDB commit holds takes one commit, staging directory or not.
+TEST_F(DiskObjectStorageTest, InodeDBTransactionWithinOneCommitTakesOne)
+try
+{
+    InodeDBTestDisk test(getContext().context);
+    if (!test.disk)
+        GTEST_SKIP() << inodedb_skip_reason;
+    auto & disk = test.disk;
+    disk->createDirectories("table");
+
+    const size_t files = 4'000;
+    auto tx = disk->createTransaction();
+    tx->setStagingDirectory("table/tmp_part");
+    tx->createDirectories("table/tmp_part");
+    InodeDBTestDisk::writeFiles(*tx, "table/tmp_part", 0, files, [](size_t) { return false; });
+
+    tx->commitStages();
+    EXPECT_FALSE(disk->existsDirectory("table/tmp_part"));
+
+    tx->commit();
+    EXPECT_EQ(test.filesIn("table/tmp_part"), files);
+}
+catch (...)
+{
+    FAIL() << DB::getCurrentExceptionMessage(true);
+}
+
+/// BigHouse: once anything removes a staging directory, or removes it and makes it again, the transaction's later
+/// stages and its last commit fail, so no commit publishes a directory that lacks a stage.
+TEST_F(DiskObjectStorageTest, InodeDBStagedTransactionFailsOnceItsDirectoryChanges)
+try
+{
+    InodeDBTestDisk test(getContext().context);
+    if (!test.disk)
+        GTEST_SKIP() << inodedb_skip_reason;
+    auto & disk = test.disk;
+    disk->createDirectories("table");
+
+    const size_t files = 5'000;
+    auto no_blobs = [](size_t) { return false; };
+    auto expect_aborted = [](const std::function<void()> & commit)
+    {
+        try
+        {
+            commit();
+            FAIL() << "The commit went through";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED) << e.message();
+        }
+    };
+
+    /// The last commit, after the directory is gone.
+    {
+        auto tx = disk->createTransaction();
+        tx->setStagingDirectory("table/tmp_removed");
+        tx->createDirectories("table/tmp_removed");
+        InodeDBTestDisk::writeFiles(*tx, "table/tmp_removed", 0, files, no_blobs);
+        tx->commitStages();
+        EXPECT_GT(test.filesIn("table/tmp_removed"), 0);
+
+        disk->removeRecursive("table/tmp_removed");
+        tx->moveDirectory("table/tmp_removed", "table/removed");
+        expect_aborted([&] { tx->commit(); });
+        EXPECT_FALSE(disk->existsDirectory("table/removed"));
+    }
+
+    /// The last commit, after the directory is gone and made again. Its remaining files and its rename would apply.
+    {
+        auto tx = disk->createTransaction();
+        tx->setStagingDirectory("table/tmp_remade");
+        tx->createDirectories("table/tmp_remade");
+        InodeDBTestDisk::writeFiles(*tx, "table/tmp_remade", 0, files, no_blobs);
+        tx->commitStages();
+
+        disk->removeRecursive("table/tmp_remade");
+        disk->createDirectories("table/tmp_remade");
+        tx->moveDirectory("table/tmp_remade", "table/remade");
+        expect_aborted([&] { tx->commit(); });
+        EXPECT_FALSE(disk->existsDirectory("table/remade"));
+    }
+
+    /// A later stage, which makes the directory again as it creates a directory inside it.
+    {
+        auto tx = disk->createTransaction();
+        tx->setStagingDirectory("table/tmp_staged");
+        tx->createDirectories("table/tmp_staged");
+        InodeDBTestDisk::writeFiles(*tx, "table/tmp_staged", 0, files, no_blobs);
+        tx->commitStages();
+
+        disk->removeRecursive("table/tmp_staged");
+        tx->createDirectories("table/tmp_staged/inner");
+        InodeDBTestDisk::writeFiles(*tx, "table/tmp_staged/inner", 0, files, no_blobs);
+        expect_aborted([&] { tx->commitStages(); });
+        EXPECT_FALSE(disk->existsDirectory("table/tmp_staged"));
+    }
+}
+catch (...)
+{
+    FAIL() << DB::getCurrentExceptionMessage(true);
+}
+
+/// BigHouse: undoing a staged transaction deletes the blobs no stage committed. The blobs of its stages stay with the
+/// staging directory, which frees them when it goes.
+TEST_F(DiskObjectStorageTest, InodeDBUndoLeavesTheBlobsOfCommittedStages)
+try
+{
+    InodeDBTestDisk test(getContext().context);
+    if (!test.disk)
+        GTEST_SKIP() << inodedb_skip_reason;
+    auto & disk = test.disk;
+    disk->createDirectories("table");
+
+    /// The first fifty files and the last fifty are blobs: the stage commits the first, and the rest wait.
+    const size_t files = 4'200;
+    auto is_blob = [&](size_t i) { return i < 50 || i >= files - 50; };
+    auto tx = disk->createTransaction();
+    tx->setStagingDirectory("table/tmp_part");
+    tx->createDirectories("table/tmp_part");
+    InodeDBTestDisk::writeFiles(*tx, "table/tmp_part", 0, files, is_blob);
+    EXPECT_EQ(test.blobs(), 100);
+
+    tx->commitStages();
+    const size_t staged = test.filesIn("table/tmp_part");
+    EXPECT_GT(staged, 50);
+    EXPECT_LT(staged, files - 50);
+
+    tx->undo();
+    EXPECT_EQ(test.blobs(), 50);
+    EXPECT_EQ(test.filesIn("table/tmp_part"), staged);
+    for (size_t i = 0; i < 50; ++i)
+        EXPECT_EQ(readAll(*disk->readFile(fmt::format("table/tmp_part/file_{}", i), {})), InodeDBTestDisk::content(i, true));
 }
 catch (...)
 {

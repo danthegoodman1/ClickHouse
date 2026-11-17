@@ -9,8 +9,11 @@
 
 #include <Common/ThreadPool_fwd.h>
 
+#include <initializer_list>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace DB
@@ -38,7 +41,15 @@ protected:
     const bool wait_blob_removal;
 
     MetadataTransactionPtr metadata_transaction;
-    std::vector<std::function<void(MetadataTransactionPtr tx)>> operations_to_execute;
+    /// What a commit applies to its metadata transaction.
+    struct Operation
+    {
+        std::function<void(MetadataTransactionPtr tx)> apply;
+        /// BigHouse: the keys of the blobs the operation hands to the metadata. Once a stage commits the operation,
+        /// they belong to the metadata, and `undo` leaves them.
+        std::vector<std::string> blobs{};
+    };
+    std::vector<Operation> operations_to_execute;
     std::unordered_map<Location, StoredObjects> written_blobs;
     /// BigHouse: a file written inline, which the commit can still write to a blob instead.
     struct InlineWrite
@@ -57,9 +68,28 @@ protected:
     /// Writes the largest inline files to blobs until the inline bytes fit `IMetadataStorage::getInlineTransactionMaxBytes`.
     void spillInlineWrites();
 
+    /// BigHouse: the directory `setStagingDirectory` named, without a trailing slash. Empty when the transaction
+    /// commits at once.
+    std::string staging_directory;
+    /// How many of the leading operations change paths under `staging_directory` alone, so a stage can commit them.
+    size_t confined_operations = 0;
+    /// The version the last stage left `staging_directory` at, once a stage has committed.
+    std::optional<UInt64> staged_version;
+    /// A stage failed, or `undo` ran after one committed. The staging directory may then hold part of the
+    /// transaction, which its owner removes, and no commit may publish it.
+    bool staging_abandoned = false;
+
+    /// Commits the first `count` operations as one stage and forgets them.
+    void commitStage(size_t count);
+    void assertStagingNotAbandoned() const;
+
     /// Execute the operation right away if the metadata storage applies operations eagerly,
-    /// otherwise queue it until commit.
-    void addOperation(std::function<void(MetadataTransactionPtr tx)> op);
+    /// otherwise queue it until commit. BigHouse: `changed` names every path the operation changes, and an
+    /// operation that names none commits with the last commit. `blobs` are the keys of `Operation::blobs`.
+    void addOperation(
+        std::function<void(MetadataTransactionPtr tx)> op,
+        std::initializer_list<std::string_view> changed = {},
+        std::vector<std::string> blobs = {});
 
 public:
     /// Record locations still missing the blob, for blobs without a per-file metadata node.
@@ -82,6 +112,9 @@ public:
     void commit() override;
     TransactionCommitOutcomeVariant tryCommit(const TransactionCommitOptionsVariant & options) override;
     void undo() noexcept override;
+
+    void setStagingDirectory(const std::string & path) override;
+    void commitStages() override;
 
     void createDirectory(const std::string & path) override;
 

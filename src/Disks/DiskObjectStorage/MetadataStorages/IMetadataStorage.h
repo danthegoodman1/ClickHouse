@@ -40,6 +40,22 @@ public:
     virtual void commit(const TransactionCommitOptionsVariant & options) = 0;
     virtual TransactionCommitOutcomeVariant tryCommit(const TransactionCommitOptionsVariant & options) = 0;
 
+    /// BigHouse: commits the transaction as one stage of a larger one, whose stages fill `directory` and whose last
+    /// commit publishes it (`IDiskTransaction::setStagingDirectory`). Every operation changes paths under
+    /// `directory` alone. `previous` is what the stage before this one returned, and the commit requires that the
+    /// directory is as that stage left it. Returns the version the commit leaves the directory at.
+    virtual UInt64 commitStage(const std::string & /* directory */, std::optional<UInt64> /* previous */)
+    {
+        throwNotImplemented();
+    }
+
+    /// BigHouse: makes the transaction's commit require that `directory` is as the stage that returned `version`
+    /// left it, so the commit publishes every stage or throws.
+    virtual void requireStage(const std::string & /* directory */, UInt64 /* version */)
+    {
+        throwNotImplemented();
+    }
+
     /// General purpose methods
 
     /// Write metadata string to file
@@ -202,6 +218,10 @@ public:
     /// BigHouse: the most inline bytes one `DiskObjectStorage` transaction of `operations` operations commits. At
     /// commit, the transaction writes its largest inline files past them to blobs.
     virtual size_t getInlineTransactionMaxBytes(size_t /*operations*/) const { return std::numeric_limits<size_t>::max(); }
+
+    /// BigHouse: the most operations one commit of a `DiskObjectStorage` transaction holds, or zero for any number.
+    /// A transaction past them commits in stages (`IDiskTransaction::setStagingDirectory`).
+    virtual size_t getCommitMaxOperations() const { return 0; }
 
     /// Returns true if underlying blob ids generator uses random.
     virtual bool areBlobPathsRandom() const = 0;

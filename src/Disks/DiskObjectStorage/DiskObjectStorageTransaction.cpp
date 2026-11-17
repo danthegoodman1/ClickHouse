@@ -32,6 +32,7 @@
 #include <functional>
 #include <memory>
 #include <ranges>
+#include <unordered_set>
 #include <vector>
 
 namespace ProfileEvents
@@ -47,12 +48,33 @@ namespace FailPoints
     extern const char smt_insert_fake_hardware_error[];
     extern const char disk_object_storage_fail_commit_metadata_transaction[];
     extern const char disk_object_storage_fail_precommit_metadata_transaction[];
+    extern const char inodedb_pause_after_stage[];
 }
 
 namespace ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
     extern const int FAULT_INJECTED;
+    extern const int LOGICAL_ERROR;
+}
+
+namespace
+{
+
+/// A path without redundant parts or trailing slashes, so a directory's path is a prefix of every path under it.
+std::string withoutRedundantParts(std::string_view path)
+{
+    std::string normal = fs::path(path).lexically_normal().string();
+    while (normal.size() > 1 && normal.ends_with('/'))
+        normal.pop_back();
+    return normal;
+}
+
+bool liesUnder(const std::string & path, const std::string & directory)
+{
+    return path.starts_with(directory) && (path.size() == directory.size() || path[directory.size()] == '/');
+}
+
 }
 
 void DiskObjectStorageTransaction::waitBlobRemoval(const StoredObjects & blobs) const
@@ -110,7 +132,7 @@ void DiskObjectStorageTransaction::addInlineWrite(StoredObject object, Locations
     addOperation([path = object.local_path, shared_data](MetadataTransactionPtr tx)
     {
         tx->writeInlineDataToFile(path, *shared_data);
-    });
+    }, {object.local_path});
 
     if (!metadata_storage->appliesOperationsEagerly())
         inline_writes.push_back({
@@ -174,21 +196,132 @@ void DiskObjectStorageTransaction::spillInlineWrites()
 
     for (const auto * write : spilled)
     {
-        operations_to_execute[write->operation] = [object = write->object, missing_locations = cluster->findComplement(write->locations)](MetadataTransactionPtr tx)
+        auto & operation = operations_to_execute[write->operation];
+        operation.apply = [object = write->object, missing_locations = cluster->findComplement(write->locations)](MetadataTransactionPtr tx)
         {
             tx->recordBlobsReplication(object, missing_locations);
             tx->createMetadataFile(object.local_path, {object});
         };
+        operation.blobs = {write->object.remote_path};
     }
     inline_writes.clear();
 }
 
-void DiskObjectStorageTransaction::addOperation(std::function<void(MetadataTransactionPtr tx)> op)
+void DiskObjectStorageTransaction::addOperation(
+    std::function<void(MetadataTransactionPtr tx)> op, std::initializer_list<std::string_view> changed, std::vector<std::string> blobs)
 {
     if (metadata_storage->appliesOperationsEagerly())
+    {
         op(metadata_transaction);
-    else
-        operations_to_execute.push_back(std::move(op));
+        return;
+    }
+
+    /// BigHouse: a stage commits a prefix of the operations, so only an unbroken run from the first one counts.
+    if (!staging_directory.empty() && confined_operations == operations_to_execute.size() && changed.size() > 0
+        && std::ranges::all_of(changed, [&](std::string_view path) { return liesUnder(withoutRedundantParts(path), staging_directory); }))
+        ++confined_operations;
+
+    operations_to_execute.push_back({.apply = std::move(op), .blobs = std::move(blobs)});
+}
+
+void DiskObjectStorageTransaction::setStagingDirectory(const std::string & path)
+{
+    if (metadata_storage->getCommitMaxOperations() == 0)
+        return;
+    if (!operations_to_execute.empty() || staged_version)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "A transaction takes its staging directory `{}` before its first operation", path);
+
+    staging_directory = withoutRedundantParts(path);
+    if (staging_directory.empty() || staging_directory == "." || staging_directory == "/")
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "`{}` names no directory to stage a transaction in", path);
+}
+
+void DiskObjectStorageTransaction::assertStagingNotAbandoned() const
+{
+    if (staging_abandoned)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "The transaction was undone after it committed part of `{}`, so it commits nothing more", staging_directory);
+}
+
+void DiskObjectStorageTransaction::commitStages()
+{
+    assertStagingNotAbandoned();
+
+    const size_t max_operations = metadata_storage->getCommitMaxOperations();
+    if (staging_directory.empty() || max_operations == 0)
+        return;
+    /// A transaction that fits one commit by its operations takes one, and writes inline files past the commit's
+    /// bytes to blobs (`spillInlineWrites`). A staged one keeps its files inline and takes more stages instead.
+    if (!staged_version && operations_to_execute.size() <= max_operations)
+        return;
+
+    try
+    {
+        while (confined_operations > 0)
+        {
+            std::vector<size_t> inline_bytes(operations_to_execute.size(), 0);
+            size_t inline_bytes_total = 0;
+            for (const auto & write : inline_writes)
+            {
+                inline_bytes[write.operation] = write.data->size();
+                inline_bytes_total += write.data->size();
+            }
+
+            if (operations_to_execute.size() <= max_operations
+                && inline_bytes_total <= metadata_storage->getInlineTransactionMaxBytes(operations_to_execute.size()))
+                break;
+
+            /// The longest run of confined operations that fits one commit, and one operation at least.
+            size_t count = 0;
+            size_t bytes = 0;
+            while (count < confined_operations && count < max_operations)
+            {
+                bytes += inline_bytes[count];
+                if (count > 0 && bytes > metadata_storage->getInlineTransactionMaxBytes(count + 1))
+                    break;
+                ++count;
+            }
+            commitStage(count);
+        }
+    }
+    catch (...)
+    {
+        /// A commit that failed may still have applied, so the directory may hold part of the transaction.
+        staging_abandoned = true;
+        undo();
+        throw;
+    }
+}
+
+void DiskObjectStorageTransaction::commitStage(size_t count)
+{
+    auto stage = metadata_storage->createTransaction();
+    for (size_t i = 0; i < count; ++i)
+        operations_to_execute[i].apply(stage);
+    staged_version = stage->commitStage(staging_directory, staged_version);
+
+    LOG_DEBUG(getLogger("DiskObjectStorageTransaction"),
+        "Committed {} operations under `{}` as a stage at version {}; {} operations remain",
+        count, staging_directory, *staged_version, operations_to_execute.size() - count);
+
+    /// The stage's blobs belong to the metadata now: removing the staging directory frees them.
+    std::unordered_set<std::string> committed_blobs;
+    for (size_t i = 0; i < count; ++i)
+        committed_blobs.insert(operations_to_execute[i].blobs.begin(), operations_to_execute[i].blobs.end());
+    for (auto & [location, blobs] : written_blobs)
+        std::erase_if(blobs, [&](const StoredObject & blob) { return committed_blobs.contains(blob.remote_path); });
+
+    operations_to_execute.erase(operations_to_execute.begin(), operations_to_execute.begin() + count);
+    confined_operations -= count;
+    std::erase_if(inline_writes, [&](const InlineWrite & write) { return write.operation < count; });
+    for (auto & write : inline_writes)
+        write.operation -= count;
+
+    if (wait_blob_removal)
+        waitBlobRemoval(stage->getSubmittedForRemovalBlobs());
+
+    /// Tests stop a writer here, with part of a transaction committed.
+    FailPointInjection::pauseFailPoint(FailPoints::inodedb_pause_after_stage);
 }
 
 void DiskObjectStorageTransaction::createDirectory(const std::string & path)
@@ -196,7 +329,7 @@ void DiskObjectStorageTransaction::createDirectory(const std::string & path)
     addOperation([path](MetadataTransactionPtr tx)
     {
         tx->createDirectory(path);
-    });
+    }, {path});
 }
 
 void DiskObjectStorageTransaction::createDirectories(const std::string & path)
@@ -204,7 +337,7 @@ void DiskObjectStorageTransaction::createDirectories(const std::string & path)
     addOperation([path](MetadataTransactionPtr tx)
     {
         tx->createDirectoryRecursive(path);
-    });
+    }, {path});
 }
 
 void DiskObjectStorageTransaction::moveDirectory(const std::string & from_path, const std::string & to_path)
@@ -212,7 +345,7 @@ void DiskObjectStorageTransaction::moveDirectory(const std::string & from_path, 
     addOperation([from_path, to_path](MetadataTransactionPtr tx)
     {
         tx->moveDirectory(from_path, to_path);
-    });
+    }, {from_path, to_path});
 }
 
 void DiskObjectStorageTransaction::moveFile(const String & from_path, const String & to_path)
@@ -220,7 +353,7 @@ void DiskObjectStorageTransaction::moveFile(const String & from_path, const Stri
     addOperation([from_path, to_path](MetadataTransactionPtr tx)
     {
         tx->moveFile(from_path, to_path);
-    });
+    }, {from_path, to_path});
 }
 
 void DiskObjectStorageTransaction::truncateFile(const String & path, size_t size)
@@ -228,7 +361,7 @@ void DiskObjectStorageTransaction::truncateFile(const String & path, size_t size
     addOperation([path, size](MetadataTransactionPtr tx)
     {
         tx->truncateFile(path, size);
-    });
+    }, {path});
 }
 
 void DiskObjectStorageTransaction::incrementBlobRefCount(const std::string & blob)
@@ -252,7 +385,7 @@ void DiskObjectStorageTransaction::replaceFile(const std::string & from_path, co
     addOperation([from_path, to_path](MetadataTransactionPtr tx)
     {
         tx->replaceFile(from_path, to_path);
-    });
+    }, {from_path, to_path});
 }
 
 void DiskObjectStorageTransaction::removeFile(const std::string & path)
@@ -260,7 +393,7 @@ void DiskObjectStorageTransaction::removeFile(const std::string & path)
     addOperation([path](MetadataTransactionPtr tx)
     {
         tx->unlinkFile(path, /*if_exists=*/false, /*should_remove_objects=*/true);
-    });
+    }, {path});
 }
 
 void DiskObjectStorageTransaction::removeSharedFile(const std::string & path, bool keep_shared_data)
@@ -268,7 +401,7 @@ void DiskObjectStorageTransaction::removeSharedFile(const std::string & path, bo
     addOperation([path, keep_shared_data](MetadataTransactionPtr tx)
     {
         tx->unlinkFile(path, /*if_exists=*/false, /*should_remove_objects=*/!keep_shared_data);
-    });
+    }, {path});
 }
 
 void DiskObjectStorageTransaction::removeSharedRecursive(
@@ -279,7 +412,7 @@ void DiskObjectStorageTransaction::removeSharedRecursive(
         addOperation([path](MetadataTransactionPtr tx)
         {
             tx->removeRecursive(path, /*should_remove_objects=*/nullptr);
-        });
+        }, {path});
     }
     else
     {
@@ -289,7 +422,7 @@ void DiskObjectStorageTransaction::removeSharedRecursive(
             {
                 return !keep_all_shared_data && !file_names_remove_metadata_only.contains(relative_path);
             });
-        });
+        }, {path});
     }
 }
 
@@ -298,7 +431,7 @@ void DiskObjectStorageTransaction::removeSharedFileIfExists(const std::string & 
     addOperation([path, keep_shared_data](MetadataTransactionPtr tx)
     {
         tx->unlinkFile(path, /*if_exists=*/true, /*should_remove_objects=*/!keep_shared_data);
-    });
+    }, {path});
 }
 
 void DiskObjectStorageTransaction::removeDirectory(const std::string & path)
@@ -306,7 +439,7 @@ void DiskObjectStorageTransaction::removeDirectory(const std::string & path)
     addOperation([path](MetadataTransactionPtr tx)
     {
         tx->removeDirectory(path);
-    });
+    }, {path});
 }
 
 void DiskObjectStorageTransaction::removeRecursive(const std::string & path)
@@ -314,7 +447,7 @@ void DiskObjectStorageTransaction::removeRecursive(const std::string & path)
     addOperation([path](MetadataTransactionPtr tx)
     {
         tx->removeRecursive(path, /*should_remove_objects=*/nullptr);
-    });
+    }, {path});
 }
 
 void DiskObjectStorageTransaction::removeFileIfExists(const std::string & path)
@@ -322,7 +455,7 @@ void DiskObjectStorageTransaction::removeFileIfExists(const std::string & path)
     addOperation([path](MetadataTransactionPtr tx)
     {
         tx->unlinkFile(path, /*if_exists=*/true, /*should_remove_objects*/true);
-    });
+    }, {path});
 }
 
 void DiskObjectStorageTransaction::removeSharedFiles(const RemoveBatchRequest & files, bool keep_all_batch_data, const NameSet & file_names_remove_metadata_only)
@@ -333,7 +466,7 @@ void DiskObjectStorageTransaction::removeSharedFiles(const RemoveBatchRequest & 
         addOperation([path, if_exists, should_remove_objects](MetadataTransactionPtr tx)
         {
             tx->unlinkFile(path, if_exists, should_remove_objects);
-        });
+        }, {path});
     }
 }
 
@@ -451,6 +584,8 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
 
         /// Locations to which blobs were not originally copied should be marked as missing.
         auto missing_locations = disk_tx->cluster->findComplement(replicated_locations);
+        /// BigHouse: an empty file that needs no blob gets a record without one.
+        const bool references_blob = mode != WriteMode::Rewrite || object.bytes_size > 0 || create_blob_if_empty;
         disk_tx->addOperation([object, mode, create_blob_if_empty, blob_replication = std::move(missing_locations)](MetadataTransactionPtr tx)
         {
             if (mode == WriteMode::Rewrite)
@@ -475,7 +610,7 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
                 /// Even if not create_blob_if_empty and size is 0, we still need to add metadata just to make sure that a file gets created if this is the 1st append
                 tx->addBlobToMetadata(object.local_path, object);
             }
-        });
+        }, {object.local_path}, references_blob ? std::vector<std::string>{object.remote_path} : std::vector<std::string>{});
 
         if (autocommit)
             disk_tx->commit();
@@ -563,7 +698,7 @@ void DiskObjectStorageTransaction::writeFileUsingBlobWritingFunction(
             tx->recordBlobsReplication(object, missing_locations);
             tx->addBlobToMetadata(object.local_path, object);
         }
-    });
+    }, {object.local_path}, {object.remote_path});
 }
 
 void DiskObjectStorageTransaction::createHardLink(const std::string & src_path, const std::string & dst_path)
@@ -571,7 +706,7 @@ void DiskObjectStorageTransaction::createHardLink(const std::string & src_path, 
     addOperation([src_path, dst_path](MetadataTransactionPtr tx)
     {
         tx->createHardLink(src_path, dst_path);
-    });
+    }, {dst_path});
 }
 
 void DiskObjectStorageTransaction::setReadOnly(const std::string & path)
@@ -579,7 +714,7 @@ void DiskObjectStorageTransaction::setReadOnly(const std::string & path)
     addOperation([path](MetadataTransactionPtr tx)
     {
         tx->setReadOnly(path);
-    });
+    }, {path});
 }
 
 void DiskObjectStorageTransaction::setLastModified(const std::string & path, const Poco::Timestamp & timestamp)
@@ -587,7 +722,7 @@ void DiskObjectStorageTransaction::setLastModified(const std::string & path, con
     addOperation([path, timestamp](MetadataTransactionPtr tx)
     {
         tx->setLastModified(path, timestamp);
-    });
+    }, {path});
 }
 
 void DiskObjectStorageTransaction::chmod(const String & path, mode_t mode)
@@ -595,7 +730,7 @@ void DiskObjectStorageTransaction::chmod(const String & path, mode_t mode)
     addOperation([path, mode](MetadataTransactionPtr tx)
     {
         tx->chmod(path, mode);
-    });
+    }, {path});
 }
 
 void DiskObjectStorageTransaction::createFile(const std::string & path)
@@ -605,7 +740,7 @@ void DiskObjectStorageTransaction::createFile(const std::string & path)
         addOperation([path](MetadataTransactionPtr tx)
         {
             tx->createMetadataFile(path, /*objects=*/{});
-        });
+        }, {path});
     }
     else
     {
@@ -694,7 +829,7 @@ void DiskObjectStorageTransaction::copyFileImpl(
             tx->recordBlobsReplication(blob, missing_locations);
 
         tx->createMetadataFile(to_file_path, blobs_to_create);
-    });
+    }, {to_file_path}, blobs_to_create | std::views::transform([](const StoredObject & blob) { return blob.remote_path; }) | std::ranges::to<std::vector<std::string>>());
 }
 
 void DiskObjectStorageTransaction::copyFile(const std::string & from_file_path, const std::string & to_file_path, const ReadSettings & read_settings, const WriteSettings & write_settings)
@@ -713,6 +848,7 @@ void DiskObjectStorageTransaction::commit()
     chassert(operations_to_execute.empty() || !metadata_storage->appliesOperationsEagerly());
     try
     {
+        commitStages();
         spillInlineWrites();
     }
     catch (...)
@@ -725,7 +861,7 @@ void DiskObjectStorageTransaction::commit()
     {
         try
         {
-            operations_to_execute[i](metadata_transaction);
+            operations_to_execute[i].apply(metadata_transaction);
         }
         catch (...)
         {
@@ -746,6 +882,8 @@ void DiskObjectStorageTransaction::commit()
             throw Exception(ErrorCodes::FAULT_INJECTED, "disk_object_storage_fail_commit_metadata_transaction");
         });
 
+        if (staged_version)
+            metadata_transaction->requireStage(staging_directory, *staged_version);
         metadata_transaction->commit(NoCommitOptions{});
     }
     catch (...)
@@ -760,6 +898,8 @@ void DiskObjectStorageTransaction::commit()
     operations_to_execute.clear();
     inline_writes.clear();
     written_blobs.clear();
+    confined_operations = 0;
+    staged_version.reset();
     LOG_TEST(getLogger("DiskObjectStorageTransaction"), "Transaction committed successfully");
 }
 
@@ -768,6 +908,7 @@ TransactionCommitOutcomeVariant DiskObjectStorageTransaction::tryCommit(const Tr
     chassert(operations_to_execute.empty() || !metadata_storage->appliesOperationsEagerly());
     try
     {
+        commitStages();
         spillInlineWrites();
     }
     catch (...)
@@ -781,7 +922,7 @@ TransactionCommitOutcomeVariant DiskObjectStorageTransaction::tryCommit(const Tr
     {
         try
         {
-            operations_to_execute[i](metadata_transaction);
+            operations_to_execute[i].apply(metadata_transaction);
 
             fiu_do_on(FailPoints::disk_object_storage_fail_precommit_metadata_transaction,
             {
@@ -813,7 +954,11 @@ TransactionCommitOutcomeVariant DiskObjectStorageTransaction::tryCommit(const Tr
     });
 
     if (std::get_if<MetaInKeeperCommitOutcome>(&outcome) == nullptr)
+    {
+        if (staged_version)
+            metadata_transaction->requireStage(staging_directory, *staged_version);
         outcome = metadata_transaction->tryCommit(options);
+    }
 
     // smt_insert_fake_hardware_error injects a fake hardware error after the commit attempt
     fiu_do_on(FailPoints::smt_insert_fake_hardware_error,
@@ -847,6 +992,8 @@ TransactionCommitOutcomeVariant DiskObjectStorageTransaction::tryCommit(const Tr
     operations_to_execute.clear();
     inline_writes.clear();
     written_blobs.clear();
+    confined_operations = 0;
+    staged_version.reset();
     LOG_TEST(getLogger("DiskObjectStorageTransaction"), "Transaction committed successfully");
 
     return outcome;
@@ -869,6 +1016,8 @@ void DiskObjectStorageTransaction::undo() noexcept
     operations_to_execute.clear();
     inline_writes.clear();
     written_blobs.clear();
+    confined_operations = 0;
+    staging_abandoned = staging_abandoned || staged_version.has_value();
 }
 
 }

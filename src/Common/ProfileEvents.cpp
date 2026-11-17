@@ -1898,6 +1898,7 @@ The server successfully detected this situation and will download merged part fr
     M(InodeDBMintKey, "Number of InodeDB `MintKey` calls.", ValueType::Number) \
     M(InodeDBRetries, "Number of InodeDB call attempts retried after the server was unavailable or slow to answer.", ValueType::Number) \
     M(InodeDBMicroseconds, "Total time spent in InodeDB calls, retries included.", ValueType::Microseconds) \
+    M(InodeDBCommitStages, "Number of `inodedb` commits that carried one stage of a transaction too large for one commit, such as a wide part of more than 4,096 files. The transaction's last commit publishes its stages.", ValueType::Number) \
     M(InodeDBCommitConflicts, "Number of `inodedb` commits that applied nothing because coordination state changed: a block number counter, a deduplication token, a table's definition or a merge claim.", ValueType::Number) \
     M(InodeDBCommitRetries, "Number of `inodedb` commits a shared writer retried with a new block number after another writer took the one it tried.", ValueType::Number) \
     M(InodeDBClaimsTaken, "Number of merge claims an `inodedb` shared writer took, an expired claim of another writer among them.", ValueType::Number) \

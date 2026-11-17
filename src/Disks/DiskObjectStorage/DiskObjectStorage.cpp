@@ -772,7 +772,9 @@ bool DiskObjectStorage::prefersRecursiveRemoval() const
 {
     /// `plain_rewritable` copies the blob of every unlinked file so that the unlink can be undone, while its
     /// recursive removal only rewrites the directory metadata and deletes all objects in bulk.
-    return metadata_storage->getType() == MetadataStorageType::PlainRewritable;
+    /// BigHouse: `inodedb` removes a directory of any size in one op and frees its files afterwards, where a batch
+    /// of an unlink for each file of a part of a few thousand files passes what InodeDB takes in one commit.
+    return metadata_storage->getType() == MetadataStorageType::PlainRewritable || metadata_storage->getType() == MetadataStorageType::InodeDB;
 }
 
 bool DiskObjectStorage::isSharedCompatible() const

@@ -30,6 +30,7 @@ public:
     /// BigHouse: delegates like `supportsInlineData`.
     size_t getInlineFileMaxBytes() const override;
     size_t getInlineTransactionMaxBytes(size_t operations) const override;
+    size_t getCommitMaxOperations() const override;
     bool appliesOperationsEagerly() const override;
     bool areBlobPathsRandom() const override;
     ObjectStorageKeyGeneratorPtr getKeyGenerator() const override;
@@ -107,6 +108,8 @@ public:
 
     void commit(const TransactionCommitOptionsVariant & options) override;
     TransactionCommitOutcomeVariant tryCommit(const TransactionCommitOptionsVariant & options) override;
+    UInt64 commitStage(const std::string & directory, std::optional<UInt64> previous) override;
+    void requireStage(const std::string & directory, UInt64 version) override;
 
     void writeStringToFile(const std::string & path, const std::string & data) override;
     void writeInlineDataToFile(const std::string & path, const std::string & data) override;

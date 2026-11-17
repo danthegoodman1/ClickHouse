@@ -42,6 +42,16 @@ public:
 
     virtual void undo() noexcept = 0;
 
+    /// BigHouse: names a directory that no reader looks into until the transaction's last commit publishes it, such
+    /// as the temporary directory of a MergeTree part. A transaction too large for one commit of its metadata
+    /// storage then commits the leading operations that change that directory alone in stages (`commitStages`),
+    /// and its last commit requires every stage to be in place. Called before the transaction's first operation.
+    virtual void setStagingDirectory(const std::string & /* path */) {}
+
+    /// BigHouse: commits stages until the rest of the transaction fits one commit. A transaction that fits one
+    /// commit, or has no staging directory, commits nothing here. `commit` and `tryCommit` call it too.
+    virtual void commitStages() {}
+
     virtual ~IDiskTransaction() = default;
 
     /// Create directory.

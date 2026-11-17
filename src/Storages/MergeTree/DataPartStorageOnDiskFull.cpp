@@ -244,6 +244,21 @@ void DataPartStorageOnDiskFull::beginTransaction()
             "Uncommitted{}transaction already exists", has_shared_transaction ? " shared " : " ");
 
     transaction = volume->getDisk()->createTransaction();
+
+    /// BigHouse: nothing loads a temporary directory as a part, or looks into one that lies inside a temporary
+    /// part, so a transaction too large for one commit fills it in stages.
+    const fs::path directory(part_dir);
+    const bool temporary = !directory.empty()
+        && (directory.begin()->string().starts_with("tmp") || (fs::path(root_path) / "").parent_path().filename().string().starts_with("tmp"));
+    if (temporary)
+        transaction->setStagingDirectory(fs::path(root_path) / part_dir);
+}
+
+void DataPartStorageOnDiskFull::precommitTransaction()
+{
+    /// BigHouse: the part's files are written, so the stages of a large part commit here, ahead of the table's lock.
+    if (transaction && !has_shared_transaction)
+        transaction->commitStages();
 }
 
 bool DataPartStorageOnDiskFull::commitsNewPartWithRename() const
